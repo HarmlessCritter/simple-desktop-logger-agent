@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# PyInstaller outputs
+build/
+dist/
+*.spec
+
+# Local environment/data
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+
+# Local logs/temp files
+*.log
+*.tmp
+*.bak
