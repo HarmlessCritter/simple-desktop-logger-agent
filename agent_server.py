@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import asyncio
@@ -21,6 +21,7 @@ from PIL import Image, ImageDraw
 
 from activity_store import ActivityStore, serialize_focus, start_of_local_day_ms
 from focus_watcher import FocusEventWatcher, FocusInfo, get_foreground_focus
+from i18n import LANGUAGE_LABELS, get_language, set_language, text
 from icon_provider import IconProvider
 
 
@@ -35,32 +36,7 @@ ERROR_ALREADY_EXISTS = 183
 AFK_TIMEOUT_MS = 30_000
 IDLE_CHECK_INTERVAL_SECONDS = 0.25
 FOCUS_SANITY_CHECK_INTERVAL_SECONDS = 2.0
-STARTUP_REMINDER_MESSAGE_KO = (
-    "Simple Desktop Logger가 기록을 시작합니다.\n"
-    "컴퓨터를 켤 때 자동으로 시작하려면 트레이 메뉴에서 설정할 수 있어요."
-)
-STARTUP_REMINDER_TITLE_KO = "Windows 시작 시 자동 실행이 꺼져 있어요"
-MENU_OPEN_DASHBOARD = "활동기록 확인 (Web)"
-MENU_INFO = "정보"
-MENU_RUN_AT_STARTUP = "Windows 시작 시 자동 실행"
-MENU_EXIT = "종료"
-INFO_TITLE = "Simple Desktop Logger 정보"
 INFO_SOURCE_URL = "https://github.com/HarmlessCritter/simple-desktop-logger-agent"
-INFO_MESSAGE = (
-    "Simple Desktop Logger 정보\n\n"
-    "이 프로그램에는 광고, 무단 데이터 수집, 그리드 등 본연의 기능과 관련 없는 "
-    "부가기능이 존재하지 않습니다.\n\n"
-    "소스코드는 GitHub에 공개되어 누구나 확인할 수 있습니다.\n"
-    "소스코드 저장소 : https://github.com/HarmlessCritter/simple-desktop-logger-agent\n\n"
-    "본 프로그램은 별도 허가 없이 자유롭게 공유 및 배포할 수 있습니다.\n"
-    "단, 프로그램을 수정하거나 변조하는 행위는 금지합니다."
-)
-
-STARTUP_REMINDER_MESSAGE_KO = (
-    "Simple Desktop Logger가 기록을 시작합니다.\n"
-    "컴퓨터를 켤 때 자동으로 시작하려면 트레이 메뉴에서 설정할 수 있어요."
-)
-STARTUP_REMINDER_TITLE_KO = "Windows 시작 시 자동 실행이 꺼져 있어요"
 MB_OK = 0x00000000
 MB_ICONINFORMATION = 0x00000040
 MB_SETFOREGROUND = 0x00010000
@@ -103,10 +79,38 @@ def get_idle_ms() -> int:
     return int((kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF)
 
 
+def build_info_message() -> str:
+    return (
+        f"{text('info.heading')}\n\n"
+        f"{text('info.safety')}\n\n"
+        f"{text('info.source_notice')}\n"
+        f"{text('info.source_label')}{INFO_SOURCE_URL}\n\n"
+        f"{text('info.permission')}"
+    )
+
+
+def wrap_text_by_words(value: str, font: tkfont.Font, max_width: int) -> str:
+    wrapped_lines: list[str] = []
+    for raw_line in value.splitlines() or [value]:
+        words = raw_line.split(" ")
+        current = ""
+        for word in words:
+            if not word:
+                continue
+            candidate = word if not current else f"{current} {word}"
+            if current and font.measure(candidate) > max_width:
+                wrapped_lines.append(current)
+                current = word
+            else:
+                current = candidate
+        wrapped_lines.append(current)
+    return "\n".join(wrapped_lines)
+
+
 def show_info_dialog() -> None:
     win = tk.Tk()
     win.withdraw()
-    win.title(INFO_TITLE)
+    win.title(text("info.title"))
     win.resizable(False, False)
     win.configure(bg="#ffffff")
 
@@ -117,15 +121,25 @@ def show_info_dialog() -> None:
     link_font.configure(underline=True)
 
     body_pad_x = 30 * 2
+    body_pad_y = 24 + 26
     icon_column_width = 28 + 17
-    source_label_text = "소스코드 저장소 : "
+    source_label_text = text("info.source_label")
     source_row_width = default_font.measure(source_label_text) + link_font.measure(INFO_SOURCE_URL)
-    dialog_width = max(660, body_pad_x + icon_column_width + source_row_width + 40)
-    dialog_height = 281
-    win.geometry(f"{dialog_width}x{dialog_height}")
+    body_texts = [text("info.heading"), text("info.safety"), text("info.source_notice"), text("info.permission")]
+    min_content_width = 430
+    right_safety_padding = 16
+    widest_body_line = max(
+        default_font.measure(line)
+        for value in body_texts
+        for line in (value.splitlines() or [value])
+    )
+    screen_width = win.winfo_screenwidth()
+    max_content_width = min(760, max(min_content_width, screen_width - body_pad_x - icon_column_width - 100))
+    content_width = max(min_content_width, min(max_content_width, widest_body_line), source_row_width)
+    dialog_width = body_pad_x + icon_column_width + content_width + right_safety_padding
 
     body = tk.Frame(win, bg="#ffffff")
-    body.pack(fill="both", expand=True, padx=30, pady=(24, 0))
+    body.pack(fill="both", expand=True, padx=30, pady=(24, 26))
 
     icon_canvas = tk.Canvas(body, width=28, height=28, bg="#ffffff", highlightthickness=0)
     icon_canvas.grid(row=0, column=0, rowspan=4, sticky="n", padx=(0, 17), pady=(0, 0))
@@ -135,20 +149,17 @@ def show_info_dialog() -> None:
     content = tk.Frame(body, bg="#ffffff")
     content.grid(row=0, column=1, sticky="nw")
 
-    tk.Label(content, text="Simple Desktop Logger 정보", bg="#ffffff", fg="#000000", font=title_font).pack(anchor="w")
+    tk.Label(content, text=text("info.heading"), bg="#ffffff", fg="#000000", font=title_font).pack(anchor="w")
     tk.Label(
         content,
-        text=(
-            "이 프로그램에는 광고, 무단 데이터 수집, 그리드 등 본연의 기능과 관련 없는\n"
-            "부가기능이 존재하지 않습니다."
-        ),
+        text=wrap_text_by_words(text("info.safety"), default_font, content_width),
         bg="#ffffff",
         fg="#000000",
         justify="left",
     ).pack(anchor="w", pady=(17, 0))
     tk.Label(
         content,
-        text="소스코드는 GitHub에 공개되어 누구나 확인할 수 있습니다.",
+        text=wrap_text_by_words(text("info.source_notice"), default_font, content_width),
         bg="#ffffff",
         fg="#000000",
         justify="left",
@@ -170,26 +181,17 @@ def show_info_dialog() -> None:
 
     tk.Label(
         content,
-        text=(
-            "본 프로그램은 별도 허가 없이 자유롭게 공유 및 배포할 수 있습니다.\n"
-            "단, 프로그램을 수정하거나 변조하는 행위는 금지합니다."
-        ),
+        text=wrap_text_by_words(text("info.permission"), default_font, content_width),
         bg="#ffffff",
         fg="#000000",
         justify="left",
     ).pack(anchor="w", pady=(16, 0))
 
-    button_row = tk.Frame(win, bg="#ffffff")
-    button_row.pack(fill="x", side="bottom", padx=16, pady=(0, 12))
-    ok_button = tk.Button(button_row, text="확인", width=9, command=win.destroy)
-    ok_button.pack(side="right")
-    ok_button.focus_set()
-    win.bind("<Return>", lambda _event: win.destroy())
     win.bind("<Escape>", lambda _event: win.destroy())
 
     win.update_idletasks()
-    screen_width = win.winfo_screenwidth()
     screen_height = win.winfo_screenheight()
+    dialog_height = max(180, body.winfo_reqheight() + body_pad_y)
     x = max(0, (screen_width - dialog_width) // 2)
     y = max(0, (screen_height - dialog_height) // 2)
     win.geometry(f"{dialog_width}x{dialog_height}+{x}+{y}")
@@ -206,7 +208,9 @@ def show_startup_reminder_toast() -> None:
     root.withdraw()
 
     toast = tk.Toplevel(root)
-    toast.title(STARTUP_REMINDER_TITLE_KO)
+    startup_title = text("startup.title")
+    startup_message = text("startup.message")
+    toast.title(startup_title)
     toast.overrideredirect(True)
     toast.attributes("-topmost", True)
     toast.configure(bg="#ffffff")
@@ -223,9 +227,9 @@ def show_startup_reminder_toast() -> None:
     close_button_right = 14
     close_button_top = 8
 
-    body_lines = STARTUP_REMINDER_MESSAGE_KO.splitlines() or [STARTUP_REMINDER_MESSAGE_KO]
+    body_lines = startup_message.splitlines() or [startup_message]
     body_natural_width = max(body_font.measure(line) for line in body_lines)
-    title_natural_width = title_font.measure(STARTUP_REMINDER_TITLE_KO) + close_button_size + 14
+    title_natural_width = title_font.measure(startup_title) + close_button_size + 14
     content_width = max(content_min_width, min(content_max_width, max(body_natural_width, title_natural_width)))
     width = accent_width + body_pad_left + content_width + body_pad_right
     margin_x = 18
@@ -242,7 +246,7 @@ def show_startup_reminder_toast() -> None:
 
     tk.Label(
         body,
-        text=STARTUP_REMINDER_TITLE_KO,
+        text=startup_title,
         bg="#ffffff",
         fg="#111827",
         font=title_font,
@@ -251,7 +255,7 @@ def show_startup_reminder_toast() -> None:
     ).pack(fill="x")
     tk.Label(
         body,
-        text=STARTUP_REMINDER_MESSAGE_KO,
+        text=startup_message,
         bg="#ffffff",
         fg="#374151",
         font=body_font,
@@ -566,7 +570,7 @@ class AgentWebSocketServer:
         self.shutdown_event = asyncio.Event()
         self.start_tracking()
         async with websockets.serve(self.handle_client, host, port):
-            print(f"Simple Desktop Logger agent server listening on ws://{host}:{port}")
+            print(text("server.listening", host=host, port=port))
             await self.shutdown_event.wait()
 
     def stop_server(self) -> None:
@@ -841,17 +845,43 @@ class TrayAgentApp:
 
     def _build_menu(self) -> pystray.Menu:
         return pystray.Menu(
-            pystray.MenuItem(MENU_INFO, self._show_info),
+            pystray.MenuItem(text("menu.info"), self._show_info),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem(MENU_OPEN_DASHBOARD, self._open_dashboard),
+            pystray.MenuItem(text("menu.open_dashboard"), self._open_dashboard),
             pystray.MenuItem(
-                MENU_RUN_AT_STARTUP,
+                text("menu.run_at_startup"),
                 self._toggle_startup,
                 checked=lambda _item: is_startup_enabled(),
             ),
+            pystray.MenuItem(
+                text("menu.language"),
+                pystray.Menu(
+                    *(
+                        pystray.MenuItem(
+                            label,
+                            self._language_action(language),
+                            checked=self._language_checked(language),
+                            radio=True,
+                        )
+                        for language, label in LANGUAGE_LABELS.items()
+                    )
+                ),
+            ),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem(MENU_EXIT, self._exit),
+            pystray.MenuItem(text("menu.exit"), self._exit),
         )
+
+    def _language_action(self, language: str):
+        def action() -> None:
+            self._set_language(language)
+
+        return action
+
+    def _language_checked(self, language: str):
+        def checked(_item) -> bool:
+            return get_language() == language
+
+        return checked
 
     def _open_dashboard(self) -> None:
         webbrowser.open(DASHBOARD_URL)
@@ -860,10 +890,15 @@ class TrayAgentApp:
         try:
             show_info_dialog()
         except Exception:
-            user32.MessageBoxW(None, INFO_MESSAGE, INFO_TITLE, MB_OK | MB_ICONINFORMATION)
+            user32.MessageBoxW(None, build_info_message(), text("info.title"), MB_OK | MB_ICONINFORMATION)
 
     def _toggle_startup(self) -> None:
         set_startup_enabled(not is_startup_enabled())
+        self.icon.update_menu()
+
+    def _set_language(self, language: str) -> None:
+        set_language(language)
+        self.icon.menu = self._build_menu()
         self.icon.update_menu()
 
     def _exit(self) -> None:
@@ -873,7 +908,7 @@ class TrayAgentApp:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the local Simple Desktop Logger WebSocket agent.")
+    parser = argparse.ArgumentParser(description=text("cli.description"))
     parser.add_argument("--host", default=HOST)
     parser.add_argument("--port", type=int, default=PORT)
     parser.add_argument("--no-tray", action="store_true", help="Run in the foreground without a tray icon.")
@@ -892,7 +927,7 @@ def main() -> int:
             try:
                 asyncio.run(server.run(args.host, args.port))
             except KeyboardInterrupt:
-                print("\nSimple Desktop Logger agent server stopped.")
+                print(f"\n{text('cli.stopped')}")
                 return 0
         else:
             TrayAgentApp(args.host, args.port).run()
