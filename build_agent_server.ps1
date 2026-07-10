@@ -13,6 +13,11 @@ python -m PyInstaller `
   --windowed `
   --hidden-import tkinter `
   --hidden-import tkinter.font `
+  --hidden-import pywinauto `
+  --hidden-import pywinauto.application `
+  --hidden-import pywinauto.controls.uiawrapper `
+  --hidden-import pywinauto.findwindows `
+  --hidden-import pywinauto.uia_defines `
   --name SimpleDesktopLoggerAgent `
   --distpath dist `
   --workpath build `

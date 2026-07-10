@@ -16,6 +16,7 @@ LANGUAGE_LABELS = {
 TRANSLATIONS = {
     "en": {
         "menu.open_dashboard": "Open Activity History (Web)",
+        "menu.open_debug_console": "Open debug console",
         "menu.info": "About",
         "menu.run_at_startup": "Run at Windows startup",
         "menu.language": "Language",
@@ -41,9 +42,11 @@ TRANSLATIONS = {
         "cli.description": "Run the local Simple Desktop Logger WebSocket agent.",
         "cli.stopped": "Simple Desktop Logger agent server stopped.",
         "server.listening": "Simple Desktop Logger agent server listening on ws://{host}:{port}",
+        "debug.title": "Simple Desktop Logger Debug Console",
     },
     "ko": {
         "menu.open_dashboard": "활동기록 확인 (Web)",
+        "menu.open_debug_console": "디버그 메뉴 열기",
         "menu.info": "정보",
         "menu.run_at_startup": "Windows 시작 시 자동 실행",
         "menu.language": "언어",
@@ -69,6 +72,7 @@ TRANSLATIONS = {
         "cli.description": "로컬 Simple Desktop Logger WebSocket 에이전트를 실행합니다.",
         "cli.stopped": "Simple Desktop Logger 에이전트 서버가 중지되었습니다.",
         "server.listening": "Simple Desktop Logger agent server listening on ws://{host}:{port}",
+        "debug.title": "Simple Desktop Logger 디버그 콘솔",
     },
 }
 

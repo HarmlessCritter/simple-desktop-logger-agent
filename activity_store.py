@@ -6,6 +6,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from browser_tracking import (
+    OTHER_SITE_LABEL,
+    favicon_url,
+    is_supported_browser,
+    normalize_browser_host,
+    raw_browser_host,
+    site_display_name,
+)
 from focus_watcher import FocusInfo
 
 
@@ -73,6 +81,20 @@ class ActivityStore:
             )
             """
         )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS browser_session_details (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                activity_session_id INTEGER NOT NULL,
+                browser_name TEXT NOT NULL,
+                url TEXT NOT NULL DEFAULT '',
+                host TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                tracking_status TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
         columns = {
             row["name"]
             for row in self.connection.execute("PRAGMA table_info(activity_sessions)").fetchall()
@@ -85,6 +107,12 @@ class ActivityStore:
         )
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_activity_sessions_activity_key ON activity_sessions(activity_key)"
+        )
+        self.connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_browser_session_details_activity_session_id
+            ON browser_session_details(activity_session_id)
+            """
         )
         self.connection.execute(
             """
@@ -137,6 +165,19 @@ class ActivityStore:
 
     def delete_activity_between(self, activity_key: str, start_ms: int, end_ms: int) -> int:
         activity_key = normalize_activity_key(activity_key)
+        self.connection.execute(
+            """
+            DELETE FROM browser_session_details
+            WHERE activity_session_id IN (
+                SELECT id
+                FROM activity_sessions
+                WHERE activity_key = ?
+                    AND ended_at >= ?
+                    AND started_at < ?
+            )
+            """,
+            (activity_key, start_ms, end_ms),
+        )
         cursor = self.connection.execute(
             """
             DELETE FROM activity_sessions
@@ -166,12 +207,18 @@ class ActivityStore:
     def is_activity_ignored(self, focus: FocusInfo) -> bool:
         return self.get_activity_key(focus) in self.get_ignored_activity_keys()
 
-    def insert_session(self, focus: FocusInfo, started_at: int, ended_at: int) -> None:
+    def insert_session(
+        self,
+        focus: FocusInfo,
+        started_at: int,
+        ended_at: int,
+        browser_detail: dict[str, Any] | None = None,
+    ) -> None:
         duration_ms = max(0, ended_at - started_at)
         if duration_ms <= 0:
             return
 
-        self.connection.execute(
+        cursor = self.connection.execute(
             """
             INSERT INTO activity_sessions (
                 started_at,
@@ -200,6 +247,31 @@ class ActivityStore:
                 now_ms(),
             ),
         )
+        activity_session_id = int(cursor.lastrowid)
+        if browser_detail is not None:
+            self.connection.execute(
+                """
+                INSERT INTO browser_session_details (
+                    activity_session_id,
+                    browser_name,
+                    url,
+                    host,
+                    title,
+                    tracking_status,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    activity_session_id,
+                    str(browser_detail.get("browser_name") or focus.process_name),
+                    str(browser_detail.get("url") or ""),
+                    str(browser_detail.get("host") or ""),
+                    str(browser_detail.get("title") or focus.window_title),
+                    str(browser_detail.get("tracking_status") or "other"),
+                    now_ms(),
+                ),
+            )
         self.connection.commit()
 
     def summary_since(self, since_ms: int) -> dict[str, dict[str, Any]]:
@@ -267,7 +339,7 @@ class ActivityStore:
             params,
         ).fetchall()
 
-        return {
+        totals = {
             row["display_name"]: {
                 "activityKey": row["activity_key"],
                 "totalMs": int(row["total_ms"] or 0),
@@ -283,6 +355,86 @@ class ActivityStore:
             }
             for row in rows
         }
+        self._add_browser_details_to_totals(totals, start_ms, end_ms)
+        return totals
+
+    def _add_browser_details_to_totals(
+        self,
+        totals: dict[str, dict[str, Any]],
+        start_ms: int,
+        end_ms: int | None,
+    ) -> None:
+        browser_items = [
+            item
+            for item in totals.values()
+            if is_supported_browser(str(item.get("focus", {}).get("process_name") or ""))
+        ]
+        if not browser_items:
+            return
+
+        if end_ms is None:
+            overlap_expression = "CASE WHEN activity_sessions.started_at < ? THEN activity_sessions.ended_at - ? ELSE activity_sessions.duration_ms END"
+            range_filter = "activity_sessions.ended_at >= ?"
+            params: tuple[Any, ...] = (start_ms, start_ms, start_ms)
+        else:
+            overlap_expression = "MAX(0, MIN(activity_sessions.ended_at, ?) - MAX(activity_sessions.started_at, ?))"
+            range_filter = "activity_sessions.ended_at >= ? AND activity_sessions.started_at < ?"
+            params = (end_ms, start_ms, start_ms, end_ms)
+
+        rows = self.connection.execute(
+            f"""
+            SELECT
+                activity_sessions.activity_key,
+                activity_sessions.process_name,
+                browser_session_details.host,
+                browser_session_details.url,
+                browser_session_details.tracking_status,
+                {overlap_expression} AS overlap_ms
+            FROM activity_sessions
+            LEFT JOIN browser_session_details
+                ON browser_session_details.activity_session_id = activity_sessions.id
+            WHERE {range_filter}
+                AND activity_sessions.activity_key NOT IN (
+                    SELECT activity_key
+                    FROM ignored_activity_rules
+                )
+            """,
+            params,
+        ).fetchall()
+
+        details_by_activity_key: dict[str, dict[str, dict[str, Any]]] = {}
+        for row in rows:
+            if not is_supported_browser(str(row["process_name"] or "")):
+                continue
+
+            overlap_ms = int(row["overlap_ms"] or 0)
+            if overlap_ms <= 0:
+                continue
+
+            host = raw_browser_host(str(row["url"] or "")) or str(row["host"] or "")
+            tracking_status = str(row["tracking_status"] or "other")
+            normalized_label = site_display_name(host, tracking_status)
+            normalized_host = normalize_browser_host(host)
+            detail_key = "other" if normalized_label == OTHER_SITE_LABEL else normalized_host
+            activity_key = str(row["activity_key"])
+            details = details_by_activity_key.setdefault(activity_key, {})
+            detail = details.setdefault(
+                detail_key,
+                {
+                    "key": f"browser:{detail_key}",
+                    "label": normalized_label,
+                    "host": normalized_host if normalized_label != OTHER_SITE_LABEL else "",
+                    "faviconUrl": favicon_url(host, tracking_status if normalized_label != OTHER_SITE_LABEL else "other"),
+                    "trackingStatus": tracking_status if normalized_label != OTHER_SITE_LABEL else "other",
+                    "totalMs": 0,
+                },
+            )
+            detail["totalMs"] += overlap_ms
+
+        for item in browser_items:
+            details = list(details_by_activity_key.get(str(item["activityKey"]), {}).values())
+            details.sort(key=lambda detail: int(detail["totalMs"]), reverse=True)
+            item["browserDetails"] = details
 
     def recent_sessions(self, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.connection.execute(
@@ -290,6 +442,32 @@ class ActivityStore:
             SELECT *
             FROM activity_sessions
             ORDER BY ended_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def recent_browser_details(self, limit: int = 30) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT
+                activity_sessions.id AS session_id,
+                activity_sessions.started_at,
+                activity_sessions.ended_at,
+                activity_sessions.duration_ms,
+                activity_sessions.process_name,
+                activity_sessions.window_title,
+                browser_session_details.id AS detail_id,
+                browser_session_details.url,
+                browser_session_details.host,
+                browser_session_details.title,
+                browser_session_details.tracking_status
+            FROM activity_sessions
+            JOIN browser_session_details
+                ON browser_session_details.activity_session_id = activity_sessions.id
+            ORDER BY activity_sessions.ended_at DESC, activity_sessions.id DESC
             LIMIT ?
             """,
             (limit,),
