@@ -14,6 +14,34 @@ BROWSER_PROCESS_NAMES = {
 }
 
 OTHER_SITE_LABEL = "Other"
+PRIVATE_BROWSER_STATUS = "private"
+UNKNOWN_BROWSER_STATUS = "unknown"
+NORMAL_BROWSER_STATUS = "normal"
+
+# Chrome exposes this label through UIAutomation on its profile/incognito button.
+# Matching the mode label, rather than a page title or URL, keeps private-page
+# content out of the detection path. The compact list covers Chrome's common UI
+# languages; an unrecognised UI state is handled conservatively as unreadable.
+PRIVATE_MODE_LABEL_TOKENS = (
+    "incognito",
+    "inprivate",
+    "private browsing",
+    "private mode",
+    "시크릿",
+    "비공개",
+    "privat",
+    "navegacion privada",
+    "navegação privada",
+    "navigation privee",
+    "navigazione in incognito",
+    "modo privado",
+    "modo anonimo",
+    "gizli mod",
+    "режим инкогнито",
+    "隐身",
+    "無痕",
+    "プライベート",
+)
 
 SITE_LABELS = {
     "chatgpt.com": "ChatGPT",
@@ -53,6 +81,7 @@ class BrowserDetail:
     host: str
     title: str
     tracking_status: str
+    privacy_mode: str = NORMAL_BROWSER_STATUS
 
 
 def is_supported_browser(process_name: str) -> bool:
@@ -62,6 +91,10 @@ def is_supported_browser(process_name: str) -> bool:
 def read_browser_detail(focus: FocusInfo) -> BrowserDetail | None:
     if not is_supported_browser(focus.process_name):
         return None
+
+    privacy_mode = chrome_privacy_mode(focus)
+    if privacy_mode != NORMAL_BROWSER_STATUS:
+        return _private_browser_detail(focus, privacy_mode)
 
     reader = ChromeUrlReader()
     url = reader.read_url(focus.hwnd)
@@ -73,12 +106,21 @@ def read_browser_detail(focus: FocusInfo) -> BrowserDetail | None:
         host=host,
         title=focus.window_title,
         tracking_status=status,
+        privacy_mode=privacy_mode,
     )
 
 
-def browser_detail_from_url(focus: FocusInfo, url: str) -> BrowserDetail | None:
+def browser_detail_from_url(
+    focus: FocusInfo,
+    url: str,
+    privacy_mode: str | None = None,
+) -> BrowserDetail | None:
     if not is_supported_browser(focus.process_name):
         return None
+
+    resolved_privacy_mode = privacy_mode or chrome_privacy_mode(focus)
+    if resolved_privacy_mode != NORMAL_BROWSER_STATUS:
+        return _private_browser_detail(focus, resolved_privacy_mode)
 
     normalized_url = normalize_url(url)
     host = raw_browser_host(normalized_url)
@@ -89,7 +131,26 @@ def browser_detail_from_url(focus: FocusInfo, url: str) -> BrowserDetail | None:
         host=host,
         title=focus.window_title,
         tracking_status=status,
+        privacy_mode=resolved_privacy_mode,
     )
+
+
+def _private_browser_detail(focus: FocusInfo, privacy_mode: str) -> BrowserDetail:
+    return BrowserDetail(
+        browser_name=focus.process_name,
+        url="",
+        host="",
+        title="",
+        tracking_status="other",
+        privacy_mode=privacy_mode,
+    )
+
+
+def chrome_privacy_mode(focus: FocusInfo) -> str:
+    if not is_supported_browser(focus.process_name):
+        return UNKNOWN_BROWSER_STATUS
+
+    return ChromeWindowInspector().privacy_mode(focus.hwnd)
 
 
 def browser_detail_key(detail: dict[str, Any] | BrowserDetail | None) -> str:
@@ -177,6 +238,36 @@ class ChromeUrlReader:
         return None
 
 
+class ChromeWindowInspector:
+    """Reads Chrome's own UI state without touching the address bar value."""
+
+    def privacy_mode(self, hwnd: int) -> str:
+        try:
+            from pywinauto import Desktop
+        except ImportError:
+            return UNKNOWN_BROWSER_STATUS
+
+        try:
+            window = Desktop(backend="uia").window(handle=hwnd)
+            profile_buttons = [
+                button
+                for button in window.descendants(control_type="Button")
+                if getattr(button.element_info, "class_name", "") == "AvatarToolbarButton"
+            ]
+        except Exception:
+            return UNKNOWN_BROWSER_STATUS
+
+        if not profile_buttons:
+            return UNKNOWN_BROWSER_STATUS
+
+        for button in profile_buttons:
+            name = str(getattr(button.element_info, "name", "") or "").casefold()
+            if any(token in name for token in PRIVATE_MODE_LABEL_TOKENS):
+                return PRIVATE_BROWSER_STATUS
+
+        return NORMAL_BROWSER_STATUS
+
+
 class ChromeAddressBarChangeHandler:
     def __init__(self, focus: FocusInfo, on_change) -> None:
         import comtypes
@@ -202,9 +293,10 @@ class ChromeAddressBarChangeHandler:
 
 
 class ChromeAddressBarEventSubscription:
-    def __init__(self, focus: FocusInfo, on_change) -> None:
+    def __init__(self, focus: FocusInfo, on_change, privacy_mode: str | None = None) -> None:
         self.focus = focus
         self.on_change = on_change
+        self.privacy_mode = privacy_mode
         self.uia = None
         self.element = None
         self.handler_wrapper: ChromeAddressBarChangeHandler | None = None
@@ -213,6 +305,9 @@ class ChromeAddressBarEventSubscription:
 
     def start(self) -> bool:
         if not is_supported_browser(self.focus.process_name):
+            return False
+        resolved_privacy_mode = self.privacy_mode or chrome_privacy_mode(self.focus)
+        if resolved_privacy_mode != NORMAL_BROWSER_STATUS:
             return False
 
         try:

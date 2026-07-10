@@ -10,7 +10,9 @@ import tkinter as tk
 import tkinter.font as tkfont
 import threading
 import time
+import traceback
 import webbrowser
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -21,16 +23,18 @@ import winreg
 from PIL import Image, ImageDraw
 
 from activity_store import ActivityStore, serialize_focus, start_of_local_day_ms
+from browser_detail_snapshot import current_browser_detail_payload, inject_current_browser_detail
+from debug_console import show_debug_console
+from diagnostic_events import DiagnosticEventRecorder
 from browser_tracking import (
     ChromeAddressBarEventSubscription,
+    NORMAL_BROWSER_STATUS,
     browser_detail_from_url,
     browser_detail_key,
-    favicon_url,
+    chrome_privacy_mode,
     is_supported_browser,
-    normalize_browser_host,
     read_browser_detail,
     serialize_browser_detail,
-    site_display_name,
 )
 from focus_watcher import FocusEventWatcher, FocusInfo, get_foreground_focus
 from i18n import LANGUAGE_LABELS, get_language, set_language, text
@@ -55,6 +59,7 @@ MB_ICONINFORMATION = 0x00000040
 MB_SETFOREGROUND = 0x00010000
 MB_TOPMOST = 0x00040000
 KST = timezone(timedelta(hours=9))
+PRIVATE_BROWSER_WINDOW_TITLE = ""
 
 
 kernel32 = ctypes.windll.kernel32
@@ -100,6 +105,21 @@ def get_idle_ms() -> int:
         raise ctypes.WinError()
 
     return int((kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF)
+
+
+def privacy_safe_focus(
+    focus: FocusInfo | None,
+    privacy_mode: str | None = None,
+) -> FocusInfo | None:
+    """Remove private Chrome page metadata before it enters tracker state."""
+    if not focus or not is_supported_browser(focus.process_name):
+        return focus
+
+    resolved_privacy_mode = privacy_mode or chrome_privacy_mode(focus)
+    if resolved_privacy_mode == NORMAL_BROWSER_STATUS:
+        return focus
+
+    return replace(focus, window_title=PRIVATE_BROWSER_WINDOW_TITLE)
 
 
 def build_info_message() -> str:
@@ -320,115 +340,6 @@ def show_startup_reminder_toast() -> None:
     root.mainloop()
 
 
-class DebugConsoleWindow:
-    def __init__(self, server: "AgentWebSocketServer") -> None:
-        self.server = server
-        self.root = tk.Tk()
-        self.root.title(text("debug.title"))
-        self.root.geometry("980x760")
-        self.root.minsize(700, 420)
-
-        frame = tk.Frame(self.root)
-        frame.pack(fill="both", expand=True)
-
-        self.output = tk.Text(frame, wrap="none", font=("Consolas", 10))
-        y_scroll = tk.Scrollbar(frame, orient="vertical", command=self.output.yview)
-        x_scroll = tk.Scrollbar(frame, orient="horizontal", command=self.output.xview)
-        self.output.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
-
-        self.output.grid(row=0, column=0, sticky="nsew")
-        y_scroll.grid(row=0, column=1, sticky="ns")
-        x_scroll.grid(row=1, column=0, sticky="ew")
-        frame.grid_rowconfigure(0, weight=1)
-        frame.grid_columnconfigure(0, weight=1)
-
-        button_row = tk.Frame(self.root)
-        button_row.pack(fill="x", padx=8, pady=8)
-        tk.Button(button_row, text="Refresh", command=self.refresh).pack(side="left")
-        tk.Button(button_row, text="Close", command=self.root.destroy).pack(side="right")
-
-        self.root.after(250, self.refresh)
-        self.root.after(1000, self.refresh_loop)
-
-    def run(self) -> None:
-        self.root.mainloop()
-
-    def refresh_loop(self) -> None:
-        if not self.root.winfo_exists():
-            return
-
-        self.refresh()
-        self.root.after(1000, self.refresh_loop)
-
-    def refresh(self) -> None:
-        try:
-            value = self._build_text()
-        except Exception as exc:
-            value = f"Unable to build debug state: {exc}"
-
-        current_scroll = self.output.yview()[0]
-        self.output.configure(state="normal")
-        self.output.delete("1.0", "end")
-        self.output.insert("1.0", value)
-        self.output.yview_moveto(current_scroll)
-        self.output.configure(state="disabled")
-
-    def _build_text(self) -> str:
-        state = self.server.debug_state()
-        lines: list[str] = []
-        lines.append("Simple Desktop Logger Agent Debug Console")
-        lines.append(f"Refreshed at: {format_debug_timestamp(now_ms())}")
-        lines.append("Refresh mode: automatic display refresh only. This window does not read Chrome URL on refresh.")
-        lines.append(f"Chrome address bar ValueChanged subscription: {state['browserValueEventSubscribed']}")
-        lines.append("")
-        lines.extend(self._section("Tracker", state["tracker"]))
-        lines.extend(self._section("Live foreground read", state["liveForeground"]))
-        lines.extend(self._browser_details_section(state["summary"]))
-        lines.append("")
-        lines.append("Test ideas:")
-        lines.append("- Switch Chrome tabs across different sites and check whether tracker.currentBrowserDetail changes.")
-        lines.append("- Move within one site, such as YouTube video A to video B, and check whether host stays stable.")
-        lines.append("- Open a new tab, chrome:// page, or private/unreadable page and check whether it becomes Other.")
-        lines.append("- Switch Chrome -> another app -> Chrome and check whether a browser detail row is saved.")
-        lines.append("- Use local URLs such as localhost/127.0.0.1 and check whether labels stay sane.")
-        return "\n".join(lines)
-
-    def _section(self, title: str, payload: dict[str, Any]) -> list[str]:
-        lines = [f"== {title} =="]
-        lines.append(json.dumps(payload, ensure_ascii=False, indent=2))
-        lines.append("")
-        return lines
-
-    def _browser_details_section(self, summary: dict[str, Any]) -> list[str]:
-        lines = ["== Today's browserDetails summary =="]
-        found = False
-        for name, item in summary.items():
-            details = item.get("browserDetails")
-            if not details:
-                continue
-
-            found = True
-            lines.append(f"{name} totalMs={item.get('totalMs')}")
-            child_total = 0
-            for detail in details:
-                child_total += int(detail.get("totalMs") or 0)
-                lines.append(
-                    "  - "
-                    f"{detail.get('label')} | host={detail.get('host')!r} | "
-                    f"totalMs={detail.get('totalMs')} | status={detail.get('trackingStatus')} | "
-                    f"key={detail.get('key')}"
-                )
-            lines.append(f"  childTotalMs={child_total}")
-        if not found:
-            lines.append("(none)")
-        lines.append("")
-        return lines
-
-
-def show_debug_console(server: "AgentWebSocketServer") -> None:
-    DebugConsoleWindow(server).run()
-
-
 class SingleInstanceLock:
     def __init__(self, name: str) -> None:
         self.name = name
@@ -499,6 +410,7 @@ class ActivityTracker:
             if not self.tracking or self.afk:
                 return None
 
+            focus = privacy_safe_focus(focus)
             change_ms = now_ms()
             previous = self.current
             previous_elapsed_ms = self._finalize_current_locked(change_ms)
@@ -556,6 +468,7 @@ class ActivityTracker:
             if not self.tracking or not self.afk:
                 return None
 
+            focus = privacy_safe_focus(focus)
             resumed_ms = now_ms()
             self.afk = False
             if focus and self.store.is_activity_ignored(focus):
@@ -648,6 +561,7 @@ class ActivityTracker:
         with self.lock:
             if not self.tracking or self.afk or not self.current or self.current_started_ms is None:
                 return None
+            focus = privacy_safe_focus(focus)
             if self.current.hwnd != focus.hwnd:
                 return None
             if self.store.is_activity_ignored(focus):
@@ -689,6 +603,7 @@ class ActivityTracker:
         with self.lock:
             if not self.tracking or self.afk or not self.current:
                 return None
+            focus = privacy_safe_focus(focus)
             if self.current.hwnd != focus.hwnd:
                 return None
             if self.store.is_activity_ignored(focus):
@@ -698,7 +613,7 @@ class ActivityTracker:
             if self.current_browser_detail is not None:
                 self.current_browser_detail = {
                     **self.current_browser_detail,
-                    "title": focus.window_title,
+                    "title": self._browser_detail_title_locked(self.current_browser_detail, focus),
                 }
 
             timestamp_ms = now_ms()
@@ -739,20 +654,31 @@ class ActivityTracker:
         if browser_detail is None:
             return None
 
-        title = focus.window_title
-        if title == "(untitled)" and self.current_browser_detail:
-            title = str(self.current_browser_detail.get("title") or title)
+        title = self._browser_detail_title_locked(browser_detail, focus)
 
         return {
             **browser_detail,
             "title": title,
         }
 
+    def _browser_detail_title_locked(
+        self,
+        browser_detail: dict[str, Any],
+        focus: FocusInfo,
+    ) -> str:
+        if str(browser_detail.get("privacy_mode") or NORMAL_BROWSER_STATUS) != NORMAL_BROWSER_STATUS:
+            return ""
+
+        title = focus.window_title
+        if title == "(untitled)" and self.current_browser_detail:
+            title = str(self.current_browser_detail.get("title") or title)
+        return title
+
     def _refresh_current_title_from_foreground_locked(self) -> None:
         if not self.current:
             return
 
-        focus = get_foreground_focus()
+        focus = privacy_safe_focus(get_foreground_focus())
         if not focus or focus.hwnd != self.current.hwnd:
             return
 
@@ -760,7 +686,7 @@ class ActivityTracker:
         if self.current_browser_detail is not None:
             self.current_browser_detail = {
                 **self.current_browser_detail,
-                "title": focus.window_title,
+                "title": self._browser_detail_title_locked(self.current_browser_detail, focus),
             }
 
     def _snapshot_locked(
@@ -772,7 +698,11 @@ class ActivityTracker:
         period_start_ms = start_ms if start_ms is not None else start_of_local_day_ms()
         totals = self.store.summary_between(period_start_ms, end_ms)
         if end_ms is None:
-            self._add_current_browser_detail_to_totals_locked(totals)
+            inject_current_browser_detail(
+                totals,
+                self._current_browser_detail_payload_locked(),
+                self.current,
+            )
         self._add_icons_to_totals_locked(totals)
         return {
             "type": "snapshot",
@@ -790,66 +720,13 @@ class ActivityTracker:
                 "recentSessions": self.store.recent_sessions(),
             }
 
-    def _add_current_browser_detail_to_totals_locked(self, totals: dict[str, dict[str, Any]]) -> None:
-        """Expose an active browser site before its in-progress session reaches SQLite."""
-        detail = self._current_browser_detail_payload_locked()
-        if detail is None:
-            return
-
-        activity_key = str(detail["parentActivityKey"])
-        parent = next(
-            (
-                item
-                for item in totals.values()
-                if str(item.get("activityKey") or "") == activity_key
-            ),
-            None,
-        )
-        if parent is None:
-            focus = serialize_focus(self.current)
-            if focus is None:
-                return
-            parent = {
-                "activityKey": activity_key,
-                "totalMs": 0,
-                "focus": focus,
-                "browserDetails": [],
-            }
-            totals[str(detail["parentDisplayName"])] = parent
-
-        browser_details = parent.setdefault("browserDetails", [])
-        detail_key = str(detail["key"])
-        if any(str(item.get("key") or "") == detail_key for item in browser_details):
-            return
-
-        browser_details.append(
-            {
-                "key": detail_key,
-                "label": detail["label"],
-                "host": detail["host"],
-                "faviconUrl": detail["faviconUrl"],
-                "trackingStatus": detail["trackingStatus"],
-                "totalMs": 0,
-            }
-        )
-
     def _current_browser_detail_payload_locked(self) -> dict[str, Any] | None:
-        if not self.current or not self.current_browser_detail or self.current_started_ms is None:
-            return None
-
-        host = str(self.current_browser_detail.get("host") or "")
-        status = str(self.current_browser_detail.get("tracking_status") or "other")
-        normalized_host = normalize_browser_host(host)
-        return {
-            "parentActivityKey": self.store.get_activity_key(self.current),
-            "parentDisplayName": self.current.display_name,
-            "key": browser_detail_key(self.current_browser_detail),
-            "label": site_display_name(host, status),
-            "host": normalized_host,
-            "faviconUrl": favicon_url(host, status),
-            "trackingStatus": status if normalized_host else "other",
-            "startedAt": self.current_started_ms,
-        }
+        return current_browser_detail_payload(
+            self.current,
+            self.current_browser_detail,
+            self.current_started_ms,
+            self.store.get_activity_key(self.current) if self.current else "",
+        )
 
     def _serialize_focus_with_icon_locked(self, focus: FocusInfo | None) -> dict[str, Any] | None:
         serialized = serialize_focus(focus)
@@ -879,6 +756,7 @@ class AgentWebSocketServer:
         self.store = ActivityStore()
         self.icon_provider = IconProvider()
         self.tracker = ActivityTracker(self.store, self.icon_provider)
+        self.diagnostics = DiagnosticEventRecorder()
         self.clients: set[Any] = set()
         self.loop: asyncio.AbstractEventLoop | None = None
         self.shutdown_event: asyncio.Event | None = None
@@ -892,7 +770,7 @@ class AgentWebSocketServer:
         self.stopping = False
 
     def debug_state(self) -> dict[str, Any]:
-        focus = get_foreground_focus()
+        focus = privacy_safe_focus(get_foreground_focus())
         return {
             "tracker": self.tracker.debug_state(),
             "liveForeground": {
@@ -902,6 +780,9 @@ class AgentWebSocketServer:
             "browserValueEventSubscribed": bool(
                 self.browser_event_subscription and self.browser_event_subscription.active
             ),
+            "recentEvents": self.diagnostics.recent_events(),
+            "diagnosticFileLogging": self.diagnostics.file_logging_enabled(),
+            "diagnosticLogPath": str(self.diagnostics.log_path),
             "summary": self.tracker.snapshot().get("totals", {}),
         }
 
@@ -910,7 +791,8 @@ class AgentWebSocketServer:
         self.shutdown_event = asyncio.Event()
         self.start_tracking()
         async with websockets.serve(self.handle_client, host, port):
-            print(text("server.listening", host=host, port=port))
+            if sys.stdout:
+                print(text("server.listening", host=host, port=port))
             await self.shutdown_event.wait()
 
     def stop_server(self) -> None:
@@ -1026,68 +908,87 @@ class AgentWebSocketServer:
     def start_focus_sanity_monitor(self) -> None:
         if not FOCUS_SANITY_MONITOR_ENABLED:
             return
-
         if self.focus_sanity_thread and self.focus_sanity_thread.is_alive():
             return
 
         self.focus_sanity_thread = threading.Thread(target=self.run_focus_sanity_monitor, daemon=True)
         self.focus_sanity_thread.start()
 
+    def handle_idle_tick(self) -> None:
+        if self.stopping:
+            return
+
+        try:
+            idle_ms = get_idle_ms()
+        except Exception as exc:
+            print(f"Unable to read idle time: {exc}")
+            return
+
+        if idle_ms >= AFK_TIMEOUT_MS:
+            self._broadcast_tracking_event("idle_monitor", self.tracker.enter_afk(idle_ms))
+            return
+
+        self._broadcast_tracking_event("idle_monitor", self.tracker.leave_afk(get_foreground_focus()))
+
     def run_idle_monitor(self) -> None:
         while not self.watch_stop_event.wait(IDLE_CHECK_INTERVAL_SECONDS):
-            try:
-                idle_ms = get_idle_ms()
-            except Exception as exc:
-                print(f"Unable to read idle time: {exc}")
-                continue
-
-            if idle_ms >= AFK_TIMEOUT_MS:
-                self.broadcast_from_thread(self.tracker.enter_afk(idle_ms))
-            else:
-                focus = get_foreground_focus()
-                self.broadcast_from_thread(self.tracker.leave_afk(focus))
+            self.handle_idle_tick()
 
     def run_focus_sanity_monitor(self) -> None:
         while not self.watch_stop_event.wait(FOCUS_SANITY_CHECK_INTERVAL_SECONDS):
-            focus = get_foreground_focus()
+            focus = privacy_safe_focus(get_foreground_focus())
             if not focus:
                 continue
-
             with self.last_focus_lock:
                 if focus.key == self.last_focus_key:
                     continue
-
+            self.diagnostics.record(
+                "focus_sanity_monitor",
+                note="Foreground differs from the last Windows event.",
+                focus=privacy_safe_focus(focus),
+            )
             self.handle_focus_changed(focus)
 
     def handle_focus_changed(self, focus: FocusInfo) -> None:
         if self.stopping:
             return
 
-        self._remember_focus(focus)
+        safe_focus = privacy_safe_focus(focus)
+        self._remember_focus(safe_focus)
         event = self.tracker.focus_changed(focus)
         self.update_browser_event_subscription(focus)
-        self.broadcast_from_thread(event)
+        self._broadcast_tracking_event("win_event_foreground", event, focus=safe_focus)
 
     def handle_window_name_changed(self, focus: FocusInfo) -> None:
         if self.stopping:
             return
 
-        self._remember_focus(focus)
+        safe_focus = privacy_safe_focus(focus)
+        self._remember_focus(safe_focus)
         if not self.tracker.is_current_window(focus):
+            self.diagnostics.record("win_event_name_change", note="Tracker window differed; treating as a foreground change.", focus=safe_focus)
             self.handle_focus_changed(focus)
             return
 
         browser_detail = serialize_browser_detail(read_browser_detail(focus))
         browser_event = self.tracker.browser_detail_changed(focus, browser_detail)
         title_event = self.tracker.window_title_changed(focus)
-        self.broadcast_from_thread(browser_event or title_event)
+        self._broadcast_tracking_event("win_event_name_change", browser_event or title_event, focus=safe_focus)
 
     def update_browser_event_subscription(self, focus: FocusInfo | None) -> None:
         self.stop_browser_event_subscription()
         if self.stopping or not focus or not is_supported_browser(focus.process_name):
             return
+        privacy_mode = chrome_privacy_mode(focus)
+        if privacy_mode != NORMAL_BROWSER_STATUS:
+            self.diagnostics.record(
+                "chrome_privacy_guard",
+                note="Chrome private or unreadable window: URL subscription intentionally disabled.",
+                focus=privacy_safe_focus(focus, privacy_mode),
+            )
+            return
 
-        subscription = ChromeAddressBarEventSubscription(focus, self.handle_browser_url_changed)
+        subscription = ChromeAddressBarEventSubscription(focus, self.handle_browser_url_changed, privacy_mode)
         if subscription.start():
             self.browser_event_subscription = subscription
 
@@ -1104,10 +1005,26 @@ class AgentWebSocketServer:
 
         focus = get_foreground_focus()
         if not self.is_active_browser_window(_subscribed_focus, focus):
+            self.diagnostics.record(
+                "chrome_uia_value_changed",
+                note="Ignored stale URL event for a non-foreground Chrome window.",
+                focus=privacy_safe_focus(focus),
+            )
             return
 
-        browser_detail = serialize_browser_detail(browser_detail_from_url(focus, url))
-        self.broadcast_from_thread(self.tracker.browser_detail_changed(focus, browser_detail))
+        privacy_mode = chrome_privacy_mode(focus)
+        safe_focus = privacy_safe_focus(focus, privacy_mode)
+        if privacy_mode != NORMAL_BROWSER_STATUS:
+            browser_detail = serialize_browser_detail(browser_detail_from_url(focus, url, privacy_mode))
+            self._broadcast_tracking_event(
+                "chrome_privacy_guard",
+                self.tracker.browser_detail_changed(focus, browser_detail),
+                focus=safe_focus,
+            )
+            return
+
+        browser_detail = serialize_browser_detail(browser_detail_from_url(focus, url, privacy_mode))
+        self._broadcast_tracking_event("chrome_uia_value_changed", self.tracker.browser_detail_changed(focus, browser_detail), focus=safe_focus)
 
     def is_active_browser_window(
         self,
@@ -1125,9 +1042,19 @@ class AgentWebSocketServer:
     def _remember_focus(self, focus: FocusInfo | None) -> None:
         if not focus:
             return
-
         with self.last_focus_lock:
             self.last_focus_key = focus.key
+
+    def _broadcast_tracking_event(
+        self,
+        source: str,
+        event: dict[str, Any] | None,
+        *,
+        focus: FocusInfo | None = None,
+    ) -> None:
+        if event:
+            self.diagnostics.record(source, event, focus=focus)
+        self.broadcast_from_thread(event)
 
     def broadcast_from_thread(self, event: dict[str, Any] | None) -> None:
         if not event or not self.loop:
@@ -1242,7 +1169,17 @@ class TrayAgentApp:
             pass
 
     def _run_server(self) -> None:
-        asyncio.run(self.server.run(self.host, self.port))
+        error_path = Path.home() / "AppData" / "Local" / "SimpleDesktopLogger" / "server-error.log"
+        try:
+            asyncio.run(self.server.run(self.host, self.port))
+        except Exception:
+            error_text = traceback.format_exc()
+            try:
+                error_path.write_text(error_text, encoding="utf-8")
+            except OSError:
+                pass
+            if sys.stderr:
+                print(error_text, file=sys.stderr)
 
     def _build_menu(self) -> pystray.Menu:
         return pystray.Menu(

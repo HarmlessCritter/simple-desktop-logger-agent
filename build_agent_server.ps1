@@ -2,6 +2,20 @@ $ErrorActionPreference = "Stop"
 
 Push-Location $PSScriptRoot
 try {
+  $distRoot = Join-Path $PSScriptRoot "dist\SimpleDesktopLoggerAgent"
+  $workRoot = Join-Path $PSScriptRoot "build\SimpleDesktopLoggerAgent"
+  foreach ($generatedPath in @($distRoot, $workRoot)) {
+    if (Test-Path -LiteralPath $generatedPath) {
+      Remove-Item -LiteralPath $generatedPath -Recurse -Force
+    }
+  }
+
+  python -m unittest discover -s tests -v
+  if ($LASTEXITCODE -ne 0) {
+    throw "Agent regression tests failed."
+  }
+
+  $buildStartedAt = Get-Date
 python -c "import tkinter; root = tkinter.Tk(); root.destroy(); print('tkinter ok')"
 if ($LASTEXITCODE -ne 0) {
   throw "tkinter check failed. Run this build with host-level execution after verifying Python/Tcl/Tk."
@@ -28,7 +42,9 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $internalPath = "dist\SimpleDesktopLoggerAgent\_internal"
+$executablePath = "dist\SimpleDesktopLoggerAgent\SimpleDesktopLoggerAgent.exe"
 $requiredPaths = @(
+  $executablePath,
   "$internalPath\_tkinter.pyd",
   "$internalPath\tcl86t.dll",
   "$internalPath\tk86t.dll",
@@ -40,6 +56,10 @@ foreach ($path in $requiredPaths) {
   if (-not (Test-Path -LiteralPath $path)) {
     throw "Build validation failed. Missing required Tk/Tcl artifact: $path"
   }
+}
+
+if ((Get-Item -LiteralPath $executablePath).LastWriteTime -lt $buildStartedAt.AddSeconds(-1)) {
+  throw "Build validation failed. Executable was not regenerated for this build."
 }
 
 $warningPath = "build\SimpleDesktopLoggerAgent\warn-SimpleDesktopLoggerAgent.txt"
