@@ -60,11 +60,12 @@ def inject_current_browser_detail(
             return
         parent = {
             "activityKey": activity_key,
+            "displayName": str(detail["parentDisplayName"]),
             "totalMs": 0,
             "focus": serialized_focus,
             "browserDetails": [],
         }
-        totals[str(detail["parentDisplayName"])] = parent
+        totals[str(detail["parentActivityKey"])] = parent
 
     browser_details = parent.setdefault("browserDetails", [])
     detail_key = str(detail["key"])

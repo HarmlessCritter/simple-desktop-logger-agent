@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from agent_server import ActivityTracker
 from browser_tracking import BrowserDetail, PRIVATE_BROWSER_STATUS
+from browser_tracking import browser_detail_key
 from focus_watcher import FocusInfo
 
 
@@ -45,6 +46,9 @@ def other_focus() -> FocusInfo:
 class FakeStore:
     def __init__(self) -> None:
         self.sessions = []
+        self.groups = []
+        self.bindings = {}
+        self.ignored_browser_sources = set()
 
     def is_activity_ignored(self, _focus: FocusInfo) -> bool:
         return False
@@ -61,8 +65,37 @@ class FakeStore:
     def ignored_activities(self):
         return []
 
+    def ignored_browser_details(self):
+        return []
+
     def recent_sessions(self):
         return []
+
+    def binding_groups(self):
+        return list(self.groups)
+
+    def source_bindings(self):
+        return dict(self.bindings)
+
+    def create_binding_group(self, display_name):
+        group = {"groupId": "group-game", "displayName": display_name.strip(), "iconId": "folder"}
+        self.groups.append(group)
+        return group
+
+    def bind_source(self, group_id, source_key):
+        self.bindings[source_key] = group_id
+        return source_key
+
+    def is_browser_detail_ignored(self, browser_detail):
+        return browser_detail_key(browser_detail) in self.ignored_browser_sources
+
+    def ignore_browser_detail(self, source_key, _display_name):
+        self.ignored_browser_sources.add(source_key)
+        return source_key
+
+    def unignore_browser_detail(self, source_key):
+        self.ignored_browser_sources.discard(source_key)
+        return source_key
 
 
 class FakeIconProvider:
@@ -129,6 +162,58 @@ class ActivityTrackerTests(unittest.TestCase):
         self.assertEqual(persisted_detail["title"], "")
         self.assertEqual(persisted_detail["url"], "")
         self.assertEqual(persisted_detail["host"], "")
+
+    def test_bound_current_browser_site_targets_group_live_time(self) -> None:
+        store = FakeStore()
+        tracker = ActivityTracker(store, FakeIconProvider())
+        tracker.create_group("Game")
+        tracker.bind_source("group-game", "browser:tooli.com")
+        detail = BrowserDetail(
+            "chrome.exe",
+            "https://tooli.com/play",
+            "tooli.com",
+            "Tooli - Chrome",
+            "tracked",
+        )
+
+        with patch("agent_server.read_browser_detail", return_value=detail):
+            event = tracker.focus_changed(chrome_focus())
+
+        snapshot = event["snapshot"]
+        self.assertEqual(snapshot["currentSummaryTarget"], {
+            "activityKey": "group:group-game",
+            "displayName": "Game",
+            "startedAt": tracker.current_started_ms,
+            "sourceKey": "browser:tooli.com",
+        })
+        self.assertNotIn("chrome.exe", snapshot["totals"])
+        self.assertEqual(
+            snapshot["totals"]["group:group-game"]["groupItems"][0]["sourceKey"],
+            "browser:tooli.com",
+        )
+
+    def test_current_ignored_browser_site_is_hidden_from_live_snapshot(self) -> None:
+        store = FakeStore()
+        tracker = ActivityTracker(store, FakeIconProvider())
+        detail = BrowserDetail(
+            "chrome.exe",
+            "https://youtube.com/watch?v=1",
+            "youtube.com",
+            "YouTube - Chrome",
+            "tracked",
+        )
+        with patch("agent_server.read_browser_detail", return_value=detail):
+            tracker.focus_changed(chrome_focus())
+        event = tracker.ignore_browser_detail("browser:youtube.com", "YouTube")
+
+        snapshot = event["snapshot"]
+        self.assertIsNone(snapshot["current"])
+        self.assertIsNone(snapshot["currentBrowserDetail"])
+        self.assertIsNone(snapshot["currentStartedAt"])
+
+        resumed = tracker.unignore_browser_detail("browser:youtube.com")
+        self.assertIsNotNone(resumed["snapshot"]["current"])
+        self.assertIsNotNone(resumed["snapshot"]["currentBrowserDetail"])
 
 
 if __name__ == "__main__":

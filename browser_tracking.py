@@ -88,13 +88,16 @@ def is_supported_browser(process_name: str) -> bool:
     return process_name.lower() in BROWSER_PROCESS_NAMES
 
 
-def read_browser_detail(focus: FocusInfo) -> BrowserDetail | None:
+def read_browser_detail(
+    focus: FocusInfo,
+    privacy_mode: str | None = None,
+) -> BrowserDetail | None:
     if not is_supported_browser(focus.process_name):
         return None
 
-    privacy_mode = chrome_privacy_mode(focus)
-    if privacy_mode != NORMAL_BROWSER_STATUS:
-        return _private_browser_detail(focus, privacy_mode)
+    resolved_privacy_mode = privacy_mode or chrome_privacy_mode(focus)
+    if resolved_privacy_mode != NORMAL_BROWSER_STATUS:
+        return _private_browser_detail(focus, resolved_privacy_mode)
 
     reader = ChromeUrlReader()
     url = reader.read_url(focus.hwnd)
@@ -106,7 +109,7 @@ def read_browser_detail(focus: FocusInfo) -> BrowserDetail | None:
         host=host,
         title=focus.window_title,
         tracking_status=status,
-        privacy_mode=privacy_mode,
+        privacy_mode=resolved_privacy_mode,
     )
 
 

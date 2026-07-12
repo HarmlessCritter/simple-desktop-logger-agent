@@ -23,6 +23,11 @@ import winreg
 from PIL import Image, ImageDraw
 
 from activity_store import ActivityStore, serialize_focus, start_of_local_day_ms
+from binding_summary import (
+    apply_bindings_to_totals,
+    current_summary_target,
+    ensure_current_group_item,
+)
 from browser_detail_snapshot import current_browser_detail_payload, inject_current_browser_detail
 from debug_console import show_debug_console
 from diagnostic_events import DiagnosticEventRecorder
@@ -364,6 +369,7 @@ class ActivityTracker:
         self.icon_provider = icon_provider
         self.current: FocusInfo | None = None
         self.current_browser_detail: dict[str, Any] | None = None
+        self.current_browser_detail_ignored = False
         self.current_started_ms: int | None = None
         self.tracking = True
         self.afk = False
@@ -374,6 +380,7 @@ class ActivityTracker:
         with self.lock:
             self.current = None
             self.current_browser_detail = None
+            self.current_browser_detail_ignored = False
             self.current_started_ms = None
             self.afk = False
             self.ignored = False
@@ -390,27 +397,35 @@ class ActivityTracker:
             self.ignored = False
             self.current = None
             self.current_browser_detail = None
+            self.current_browser_detail_ignored = False
             self.current_started_ms = None
 
     def debug_state(self) -> dict[str, Any]:
         with self.lock:
+            visible_current = None if self.current_browser_detail_ignored else self.current
+            visible_detail = None if self.current_browser_detail_ignored else self.current_browser_detail
             return {
                 "tracking": self.tracking,
                 "afk": self.afk,
                 "ignored": self.ignored,
-                "current": self._serialize_focus_with_icon_locked(self.current) if self.current else None,
-                "currentStartedAt": self.current_started_ms,
-                "currentStartedAtText": format_debug_timestamp(self.current_started_ms),
-                "currentBrowserDetail": self.current_browser_detail,
-                "currentBrowserDetailKey": browser_detail_key(self.current_browser_detail),
+                "current": self._serialize_focus_with_icon_locked(visible_current) if visible_current else None,
+                "currentStartedAt": self.current_started_ms if visible_current else None,
+                "currentStartedAtText": format_debug_timestamp(self.current_started_ms if visible_current else None),
+                "currentBrowserDetail": visible_detail,
+                "currentBrowserDetailKey": browser_detail_key(visible_detail),
+                "currentBrowserDetailIgnored": self.current_browser_detail_ignored,
             }
 
-    def focus_changed(self, focus: FocusInfo) -> dict[str, Any] | None:
+    def focus_changed(
+        self,
+        focus: FocusInfo,
+        privacy_mode: str | None = None,
+    ) -> dict[str, Any] | None:
         with self.lock:
             if not self.tracking or self.afk:
                 return None
 
-            focus = privacy_safe_focus(focus)
+            focus = privacy_safe_focus(focus, privacy_mode)
             change_ms = now_ms()
             previous = self.current
             previous_elapsed_ms = self._finalize_current_locked(change_ms)
@@ -418,6 +433,7 @@ class ActivityTracker:
             if self.store.is_activity_ignored(focus):
                 self.current = None
                 self.current_browser_detail = None
+                self.current_browser_detail_ignored = False
                 self.current_started_ms = None
                 self.ignored = True
                 return {
@@ -431,7 +447,8 @@ class ActivityTracker:
 
             self.ignored = False
             self.current = focus
-            self.current_browser_detail = self._read_browser_detail_locked(focus)
+            self.current_browser_detail = self._read_browser_detail_locked(focus, privacy_mode)
+            self.current_browser_detail_ignored = self.store.is_browser_detail_ignored(self.current_browser_detail)
             self.current_started_ms = change_ms
 
             return {
@@ -452,6 +469,7 @@ class ActivityTracker:
             self._finalize_current_locked(afk_started_ms)
             self.current = None
             self.current_browser_detail = None
+            self.current_browser_detail_ignored = False
             self.current_started_ms = None
             self.afk = True
             self.ignored = False
@@ -463,23 +481,29 @@ class ActivityTracker:
                 "snapshot": self._snapshot_locked(afk_started_ms),
             }
 
-    def leave_afk(self, focus: FocusInfo | None) -> dict[str, Any] | None:
+    def leave_afk(
+        self,
+        focus: FocusInfo | None,
+        privacy_mode: str | None = None,
+    ) -> dict[str, Any] | None:
         with self.lock:
             if not self.tracking or not self.afk:
                 return None
 
-            focus = privacy_safe_focus(focus)
+            focus = privacy_safe_focus(focus, privacy_mode)
             resumed_ms = now_ms()
             self.afk = False
             if focus and self.store.is_activity_ignored(focus):
                 self.ignored = True
                 self.current = None
                 self.current_browser_detail = None
+                self.current_browser_detail_ignored = False
                 self.current_started_ms = None
             else:
                 self.ignored = False
                 self.current = focus
-                self.current_browser_detail = self._read_browser_detail_locked(focus)
+                self.current_browser_detail = self._read_browser_detail_locked(focus, privacy_mode)
+                self.current_browser_detail_ignored = self.store.is_browser_detail_ignored(self.current_browser_detail)
                 self.current_started_ms = resumed_ms if focus else None
 
             return {
@@ -498,6 +522,7 @@ class ActivityTracker:
                 self._finalize_current_locked(timestamp_ms)
                 self.current = None
                 self.current_browser_detail = None
+                self.current_browser_detail_ignored = False
                 self.current_started_ms = None
                 self.ignored = True
 
@@ -524,6 +549,7 @@ class ActivityTracker:
                 self.ignored = False
                 self.current = focus
                 self.current_browser_detail = self._read_browser_detail_locked(focus)
+                self.current_browser_detail_ignored = self.store.is_browser_detail_ignored(self.current_browser_detail)
                 self.current_started_ms = timestamp_ms
 
             return {
@@ -557,11 +583,124 @@ class ActivityTracker:
                 "snapshot": self._snapshot_locked(timestamp_ms, start_ms, end_ms),
             }
 
-    def browser_detail_changed(self, focus: FocusInfo, browser_detail: dict[str, Any] | None) -> dict[str, Any] | None:
+    def create_group(self, display_name: str) -> dict[str, Any]:
+        with self.lock:
+            group = self.store.create_binding_group(display_name)
+            timestamp_ms = now_ms()
+            return {
+                "type": "group_created",
+                "at": timestamp_ms,
+                "group": group,
+                "snapshot": self._snapshot_locked(timestamp_ms),
+            }
+
+    def rename_group(self, group_id: str, display_name: str) -> dict[str, Any]:
+        with self.lock:
+            group = self.store.rename_binding_group(group_id, display_name)
+            timestamp_ms = now_ms()
+            return {
+                "type": "group_renamed",
+                "at": timestamp_ms,
+                "group": group,
+                "snapshot": self._snapshot_locked(timestamp_ms),
+            }
+
+    def delete_group(self, group_id: str) -> dict[str, Any]:
+        with self.lock:
+            self.store.delete_binding_group(group_id)
+            timestamp_ms = now_ms()
+            return {
+                "type": "group_deleted",
+                "at": timestamp_ms,
+                "groupId": group_id,
+                "snapshot": self._snapshot_locked(timestamp_ms),
+            }
+
+    def set_group_icon(self, group_id: str, icon_id: str) -> dict[str, Any]:
+        with self.lock:
+            group = self.store.set_binding_group_icon(group_id, icon_id)
+            timestamp_ms = now_ms()
+            return {
+                "type": "group_icon_changed",
+                "at": timestamp_ms,
+                "group": group,
+                "snapshot": self._snapshot_locked(timestamp_ms),
+            }
+
+    def bind_source(self, group_id: str, source_key: str) -> dict[str, Any]:
+        with self.lock:
+            normalized_source_key = self.store.bind_source(group_id, source_key)
+            timestamp_ms = now_ms()
+            return {
+                "type": "source_bound",
+                "at": timestamp_ms,
+                "groupId": group_id,
+                "sourceKey": normalized_source_key,
+                "snapshot": self._snapshot_locked(timestamp_ms),
+            }
+
+    def unbind_source(self, source_key: str) -> dict[str, Any]:
+        with self.lock:
+            normalized_source_key = self.store.unbind_source(source_key)
+            timestamp_ms = now_ms()
+            return {
+                "type": "source_unbound",
+                "at": timestamp_ms,
+                "sourceKey": normalized_source_key,
+                "snapshot": self._snapshot_locked(timestamp_ms),
+            }
+
+    def ignore_browser_detail(self, source_key: str, display_name: str) -> dict[str, Any]:
+        with self.lock:
+            normalized_source_key = self.store.ignore_browser_detail(source_key, display_name)
+            timestamp_ms = now_ms()
+            if browser_detail_key(self.current_browser_detail) == normalized_source_key:
+                self._finalize_current_locked(timestamp_ms)
+                self.current_started_ms = timestamp_ms
+                self.current_browser_detail_ignored = True
+            return {
+                "type": "browser_detail_ignored",
+                "at": timestamp_ms,
+                "sourceKey": normalized_source_key,
+                "snapshot": self._snapshot_locked(timestamp_ms),
+            }
+
+    def unignore_browser_detail(self, source_key: str) -> dict[str, Any]:
+        with self.lock:
+            normalized_source_key = self.store.unignore_browser_detail(source_key)
+            timestamp_ms = now_ms()
+            if browser_detail_key(self.current_browser_detail) == normalized_source_key:
+                self.current_browser_detail_ignored = False
+                self.current_started_ms = timestamp_ms
+            return {
+                "type": "browser_detail_unignored",
+                "at": timestamp_ms,
+                "sourceKey": normalized_source_key,
+                "snapshot": self._snapshot_locked(timestamp_ms),
+            }
+
+    def delete_browser_detail(self, source_key: str, start_ms: int, end_ms: int) -> dict[str, Any]:
+        with self.lock:
+            deleted_count = self.store.delete_browser_detail_between(source_key, start_ms, end_ms)
+            timestamp_ms = now_ms()
+            return {
+                "type": "browser_detail_deleted",
+                "at": timestamp_ms,
+                "sourceKey": source_key,
+                "deletedCount": deleted_count,
+                "snapshot": self._snapshot_locked(timestamp_ms, start_ms, end_ms),
+            }
+
+    def browser_detail_changed(
+        self,
+        focus: FocusInfo,
+        browser_detail: dict[str, Any] | None,
+        privacy_mode: str | None = None,
+    ) -> dict[str, Any] | None:
         with self.lock:
             if not self.tracking or self.afk or not self.current or self.current_started_ms is None:
                 return None
-            focus = privacy_safe_focus(focus)
+            focus = privacy_safe_focus(focus, privacy_mode)
             if self.current.hwnd != focus.hwnd:
                 return None
             if self.store.is_activity_ignored(focus):
@@ -573,6 +712,7 @@ class ActivityTracker:
                 timestamp_ms = now_ms()
                 self.current = focus
                 self.current_browser_detail = self._merge_browser_detail_title_locked(browser_detail, focus)
+                self.current_browser_detail_ignored = self.store.is_browser_detail_ignored(self.current_browser_detail)
                 return {
                     "type": "browser_detail_updated",
                     "at": timestamp_ms,
@@ -586,6 +726,7 @@ class ActivityTracker:
             previous_elapsed_ms = self._finalize_current_locked(timestamp_ms)
             self.current = focus
             self.current_browser_detail = self._merge_browser_detail_title_locked(browser_detail, focus)
+            self.current_browser_detail_ignored = self.store.is_browser_detail_ignored(self.current_browser_detail)
             self.current_started_ms = timestamp_ms
             self.ignored = False
 
@@ -599,11 +740,16 @@ class ActivityTracker:
                 "snapshot": self._snapshot_locked(timestamp_ms),
             }
 
-    def window_title_changed(self, focus: FocusInfo) -> dict[str, Any] | None:
+    def window_title_changed(
+        self,
+        focus: FocusInfo,
+        privacy_mode: str | None = None,
+        include_snapshot: bool = True,
+    ) -> dict[str, Any] | None:
         with self.lock:
             if not self.tracking or self.afk or not self.current:
                 return None
-            focus = privacy_safe_focus(focus)
+            focus = privacy_safe_focus(focus, privacy_mode)
             if self.current.hwnd != focus.hwnd:
                 return None
             if self.store.is_activity_ignored(focus):
@@ -617,6 +763,8 @@ class ActivityTracker:
                 }
 
             timestamp_ms = now_ms()
+            if not include_snapshot:
+                return None
             return {
                 "type": "window_title_changed",
                 "at": timestamp_ms,
@@ -639,12 +787,17 @@ class ActivityTracker:
 
         self._refresh_current_title_from_foreground_locked()
         elapsed_ms = max(0, ended_at - self.current_started_ms)
-        self.store.insert_session(self.current, self.current_started_ms, ended_at, self.current_browser_detail)
+        if not self.current_browser_detail_ignored:
+            self.store.insert_session(self.current, self.current_started_ms, ended_at, self.current_browser_detail)
         self.current_started_ms = ended_at
         return elapsed_ms
 
-    def _read_browser_detail_locked(self, focus: FocusInfo | None) -> dict[str, Any] | None:
-        return serialize_browser_detail(read_browser_detail(focus)) if focus else None
+    def _read_browser_detail_locked(
+        self,
+        focus: FocusInfo | None,
+        privacy_mode: str | None = None,
+    ) -> dict[str, Any] | None:
+        return serialize_browser_detail(read_browser_detail(focus, privacy_mode)) if focus else None
 
     def _merge_browser_detail_title_locked(
         self,
@@ -677,6 +830,8 @@ class ActivityTracker:
     def _refresh_current_title_from_foreground_locked(self) -> None:
         if not self.current:
             return
+        if is_supported_browser(self.current.process_name):
+            return
 
         focus = privacy_safe_focus(get_foreground_focus())
         if not focus or focus.hwnd != self.current.hwnd:
@@ -697,12 +852,37 @@ class ActivityTracker:
     ) -> dict[str, Any]:
         period_start_ms = start_ms if start_ms is not None else start_of_local_day_ms()
         totals = self.store.summary_between(period_start_ms, end_ms)
-        if end_ms is None:
+        visible_current = None if self.current_browser_detail_ignored else self.current
+        visible_browser_detail = None if self.current_browser_detail_ignored else self.current_browser_detail
+        visible_started_ms = None if self.current_browser_detail_ignored else self.current_started_ms
+        if end_ms is None and visible_current:
             inject_current_browser_detail(
                 totals,
-                self._current_browser_detail_payload_locked(),
-                self.current,
+                current_browser_detail_payload(
+                    visible_current,
+                    visible_browser_detail,
+                    visible_started_ms,
+                    self.store.get_activity_key(visible_current),
+                ),
+                visible_current,
             )
+        binding_groups = self.store.binding_groups()
+        source_bindings = self.store.source_bindings()
+        summary_target = current_summary_target(
+            visible_current,
+            visible_browser_detail,
+            visible_started_ms,
+            self.store.get_activity_key(visible_current) if visible_current else "",
+            binding_groups,
+            source_bindings,
+        )
+        totals = apply_bindings_to_totals(totals, binding_groups, source_bindings)
+        ensure_current_group_item(
+            totals,
+            summary_target,
+            visible_current,
+            visible_browser_detail,
+        )
         self._add_icons_to_totals_locked(totals)
         return {
             "type": "snapshot",
@@ -712,11 +892,18 @@ class ActivityTracker:
                 "tracking": self.tracking,
                 "afk": self.afk,
                 "ignored": self.ignored,
-                "current": self._serialize_focus_with_icon_locked(self.current) if self.current else None,
-                "currentStartedAt": self.current_started_ms,
-                "currentBrowserDetail": self._current_browser_detail_payload_locked(),
+                "current": self._serialize_focus_with_icon_locked(visible_current) if visible_current else None,
+                "currentStartedAt": visible_started_ms,
+                "currentBrowserDetail": current_browser_detail_payload(
+                    visible_current,
+                    visible_browser_detail,
+                    visible_started_ms,
+                    self.store.get_activity_key(visible_current) if visible_current else "",
+                ),
+                "currentSummaryTarget": summary_target,
                 "totals": totals,
-                "ignoredActivities": self.store.ignored_activities(),
+                "bindingGroups": binding_groups,
+                "ignoredActivities": self.store.ignored_activities() + self.store.ignored_browser_details(),
                 "recentSessions": self.store.recent_sessions(),
             }
 
@@ -741,6 +928,13 @@ class ActivityTracker:
             focus = item.get("focus")
             if isinstance(focus, dict):
                 self._add_icon_to_focus_locked(focus)
+            group_items = item.get("groupItems")
+            if not isinstance(group_items, list):
+                continue
+            for group_item in group_items:
+                group_focus = group_item.get("focus")
+                if isinstance(group_focus, dict):
+                    self._add_icon_to_focus_locked(group_focus)
 
     def _add_icon_to_focus_locked(self, focus: dict[str, Any]) -> None:
         icon_data_url = self.icon_provider.get_icon_data_url(
@@ -752,8 +946,8 @@ class ActivityTracker:
 
 
 class AgentWebSocketServer:
-    def __init__(self) -> None:
-        self.store = ActivityStore()
+    def __init__(self, store: ActivityStore | None = None) -> None:
+        self.store = store or ActivityStore()
         self.icon_provider = IconProvider()
         self.tracker = ActivityTracker(self.store, self.icon_provider)
         self.diagnostics = DiagnosticEventRecorder()
@@ -764,13 +958,18 @@ class AgentWebSocketServer:
         self.idle_thread: threading.Thread | None = None
         self.focus_sanity_thread: threading.Thread | None = None
         self.browser_event_subscription: ChromeAddressBarEventSubscription | None = None
+        self.browser_privacy_modes: dict[tuple[int, int], str] = {}
+        self.latest_snapshot: dict[str, Any] | None = None
+        self.latest_snapshot_lock = threading.Lock()
         self.last_focus_key: tuple[int, int, str, str] | None = None
         self.last_focus_lock = threading.Lock()
         self.watch_stop_event = threading.Event()
         self.stopping = False
 
     def debug_state(self) -> dict[str, Any]:
-        focus = privacy_safe_focus(get_foreground_focus())
+        raw_focus = get_foreground_focus()
+        focus = privacy_safe_focus(raw_focus, self._privacy_mode_for_focus(raw_focus))
+        snapshot = self._latest_snapshot()
         return {
             "tracker": self.tracker.debug_state(),
             "liveForeground": {
@@ -783,7 +982,7 @@ class AgentWebSocketServer:
             "recentEvents": self.diagnostics.recent_events(),
             "diagnosticFileLogging": self.diagnostics.file_logging_enabled(),
             "diagnosticLogPath": str(self.diagnostics.log_path),
-            "summary": self.tracker.snapshot().get("totals", {}),
+            "summary": snapshot.get("totals", {}),
         }
 
     async def run(self, host: str, port: int) -> None:
@@ -810,7 +1009,9 @@ class AgentWebSocketServer:
 
     async def handle_client(self, websocket) -> None:
         self.clients.add(websocket)
-        await self.send(websocket, {"type": "agent_ready", "snapshot": self.tracker.snapshot()})
+        snapshot = self.tracker.snapshot()
+        self._remember_snapshot(snapshot)
+        await self.send(websocket, {"type": "agent_ready", "snapshot": snapshot})
 
         try:
             async for raw_message in websocket:
@@ -835,7 +1036,9 @@ class AgentWebSocketServer:
         elif message_type == "get_snapshot":
             start_ms = self._optional_int(message.get("startMs"))
             end_ms = self._optional_int(message.get("endMs"))
-            await self.send(websocket, self.tracker.snapshot(start_ms, end_ms))
+            snapshot = self.tracker.snapshot(start_ms, end_ms)
+            self._remember_snapshot(snapshot)
+            await self.send(websocket, snapshot)
         elif message_type == "ignore_activity":
             display_name = str(message.get("displayName") or "").strip()
             activity_key = str(message.get("activityKey") or display_name.lower()).strip().lower()
@@ -860,8 +1063,61 @@ class AgentWebSocketServer:
                 return
 
             await self.broadcast(self.tracker.delete_activity(activity_key, start_ms, end_ms))
+        elif message_type == "create_group":
+            name = str(message.get("name") or "")
+            await self._broadcast_binding_command(websocket, lambda: self.tracker.create_group(name))
+        elif message_type == "rename_group":
+            group_id = str(message.get("groupId") or "")
+            name = str(message.get("name") or "")
+            await self._broadcast_binding_command(websocket, lambda: self.tracker.rename_group(group_id, name))
+        elif message_type == "delete_group":
+            group_id = str(message.get("groupId") or "")
+            await self._broadcast_binding_command(websocket, lambda: self.tracker.delete_group(group_id))
+        elif message_type == "set_group_icon":
+            group_id = str(message.get("groupId") or "")
+            icon_id = str(message.get("iconId") or "")
+            await self._broadcast_binding_command(websocket, lambda: self.tracker.set_group_icon(group_id, icon_id))
+        elif message_type == "bind_source":
+            group_id = str(message.get("groupId") or "")
+            source_key = str(message.get("sourceKey") or "")
+            await self._broadcast_binding_command(websocket, lambda: self.tracker.bind_source(group_id, source_key))
+        elif message_type == "unbind_source":
+            source_key = str(message.get("sourceKey") or "")
+            await self._broadcast_binding_command(websocket, lambda: self.tracker.unbind_source(source_key))
+        elif message_type == "ignore_browser_detail":
+            source_key = str(message.get("sourceKey") or "")
+            display_name = str(message.get("displayName") or "")
+            await self._broadcast_binding_command(
+                websocket,
+                lambda: self.tracker.ignore_browser_detail(source_key, display_name),
+            )
+        elif message_type == "unignore_browser_detail":
+            source_key = str(message.get("sourceKey") or "")
+            await self._broadcast_binding_command(
+                websocket,
+                lambda: self.tracker.unignore_browser_detail(source_key),
+            )
+        elif message_type == "delete_browser_detail":
+            source_key = str(message.get("sourceKey") or "")
+            start_ms = self._optional_int(message.get("startMs"))
+            end_ms = self._optional_int(message.get("endMs"))
+            if start_ms is None or end_ms is None or end_ms <= start_ms:
+                await self.send(websocket, {"type": "error", "message": "Missing or invalid delete range."})
+                return
+            await self._broadcast_binding_command(
+                websocket,
+                lambda: self.tracker.delete_browser_detail(source_key, start_ms, end_ms),
+            )
         else:
             await self.send(websocket, {"type": "error", "message": f"Unknown message type: {message_type}"})
+
+    async def _broadcast_binding_command(self, websocket, command) -> None:
+        try:
+            event = command()
+        except ValueError as exc:
+            await self.send(websocket, {"type": "error", "message": str(exc)})
+            return
+        await self.broadcast(event)
 
     def _optional_int(self, value: Any) -> int | None:
         if value is None:
@@ -928,7 +1184,11 @@ class AgentWebSocketServer:
             self._broadcast_tracking_event("idle_monitor", self.tracker.enter_afk(idle_ms))
             return
 
-        self._broadcast_tracking_event("idle_monitor", self.tracker.leave_afk(get_foreground_focus()))
+        focus = get_foreground_focus()
+        self._broadcast_tracking_event(
+            "idle_monitor",
+            self.tracker.leave_afk(focus, self._privacy_mode_for_focus(focus)),
+        )
 
     def run_idle_monitor(self) -> None:
         while not self.watch_stop_event.wait(IDLE_CHECK_INTERVAL_SECONDS):
@@ -936,59 +1196,76 @@ class AgentWebSocketServer:
 
     def run_focus_sanity_monitor(self) -> None:
         while not self.watch_stop_event.wait(FOCUS_SANITY_CHECK_INTERVAL_SECONDS):
-            focus = privacy_safe_focus(get_foreground_focus())
-            if not focus:
+            raw_focus = get_foreground_focus()
+            if not raw_focus:
                 continue
+            privacy_mode = self._privacy_mode_for_focus(raw_focus)
+            focus = privacy_safe_focus(raw_focus, privacy_mode)
             with self.last_focus_lock:
                 if focus.key == self.last_focus_key:
                     continue
             self.diagnostics.record(
                 "focus_sanity_monitor",
                 note="Foreground differs from the last Windows event.",
-                focus=privacy_safe_focus(focus),
+                focus=focus,
             )
-            self.handle_focus_changed(focus)
+            self.handle_focus_changed(raw_focus, privacy_mode)
 
-    def handle_focus_changed(self, focus: FocusInfo) -> None:
+    def handle_focus_changed(self, focus: FocusInfo, privacy_mode: str | None = None) -> None:
         if self.stopping:
             return
 
-        safe_focus = privacy_safe_focus(focus)
+        resolved_privacy_mode = privacy_mode or self._privacy_mode_for_focus(focus)
+        safe_focus = privacy_safe_focus(focus, resolved_privacy_mode)
         self._remember_focus(safe_focus)
-        event = self.tracker.focus_changed(focus)
-        self.update_browser_event_subscription(focus)
+        event = self.tracker.focus_changed(focus, resolved_privacy_mode)
+        self.update_browser_event_subscription(focus, resolved_privacy_mode)
         self._broadcast_tracking_event("win_event_foreground", event, focus=safe_focus)
 
     def handle_window_name_changed(self, focus: FocusInfo) -> None:
         if self.stopping:
             return
 
-        safe_focus = privacy_safe_focus(focus)
+        privacy_mode = self._privacy_mode_for_focus(focus)
+        safe_focus = privacy_safe_focus(focus, privacy_mode)
         self._remember_focus(safe_focus)
         if not self.tracker.is_current_window(focus):
             self.diagnostics.record("win_event_name_change", note="Tracker window differed; treating as a foreground change.", focus=safe_focus)
-            self.handle_focus_changed(focus)
+            self.handle_focus_changed(focus, privacy_mode)
             return
 
-        browser_detail = serialize_browser_detail(read_browser_detail(focus))
-        browser_event = self.tracker.browser_detail_changed(focus, browser_detail)
-        title_event = self.tracker.window_title_changed(focus)
-        self._broadcast_tracking_event("win_event_name_change", browser_event or title_event, focus=safe_focus)
-
-    def update_browser_event_subscription(self, focus: FocusInfo | None) -> None:
-        self.stop_browser_event_subscription()
-        if self.stopping or not focus or not is_supported_browser(focus.process_name):
-            return
-        privacy_mode = chrome_privacy_mode(focus)
-        if privacy_mode != NORMAL_BROWSER_STATUS:
+        if self._has_active_browser_subscription(focus):
+            self.tracker.window_title_changed(focus, privacy_mode, include_snapshot=False)
             self.diagnostics.record(
-                "chrome_privacy_guard",
-                note="Chrome private or unreadable window: URL subscription intentionally disabled.",
-                focus=privacy_safe_focus(focus, privacy_mode),
+                "win_event_name_change",
+                {"type": "window_title_updated", "at": now_ms()},
+                focus=safe_focus,
             )
             return
 
-        subscription = ChromeAddressBarEventSubscription(focus, self.handle_browser_url_changed, privacy_mode)
+        if is_supported_browser(focus.process_name):
+            browser_detail = serialize_browser_detail(read_browser_detail(focus, privacy_mode))
+            browser_event = self.tracker.browser_detail_changed(focus, browser_detail, privacy_mode)
+            self._broadcast_tracking_event("win_event_name_change", browser_event, focus=safe_focus)
+            return
+
+        title_event = self.tracker.window_title_changed(focus, privacy_mode)
+        self._broadcast_tracking_event("win_event_name_change", title_event, focus=safe_focus)
+
+    def update_browser_event_subscription(self, focus: FocusInfo | None, privacy_mode: str | None = None) -> None:
+        self.stop_browser_event_subscription()
+        if self.stopping or not focus or not is_supported_browser(focus.process_name):
+            return
+        resolved_privacy_mode = privacy_mode or self._privacy_mode_for_focus(focus)
+        if resolved_privacy_mode != NORMAL_BROWSER_STATUS:
+            self.diagnostics.record(
+                "chrome_privacy_guard",
+                note="Chrome private or unreadable window: URL subscription intentionally disabled.",
+                focus=privacy_safe_focus(focus, resolved_privacy_mode),
+            )
+            return
+
+        subscription = ChromeAddressBarEventSubscription(focus, self.handle_browser_url_changed, resolved_privacy_mode)
         if subscription.start():
             self.browser_event_subscription = subscription
 
@@ -1008,23 +1285,27 @@ class AgentWebSocketServer:
             self.diagnostics.record(
                 "chrome_uia_value_changed",
                 note="Ignored stale URL event for a non-foreground Chrome window.",
-                focus=privacy_safe_focus(focus),
+                focus=privacy_safe_focus(focus, self._privacy_mode_for_focus(focus)),
             )
             return
 
-        privacy_mode = chrome_privacy_mode(focus)
+        privacy_mode = self._privacy_mode_for_focus(focus)
         safe_focus = privacy_safe_focus(focus, privacy_mode)
         if privacy_mode != NORMAL_BROWSER_STATUS:
             browser_detail = serialize_browser_detail(browser_detail_from_url(focus, url, privacy_mode))
             self._broadcast_tracking_event(
                 "chrome_privacy_guard",
-                self.tracker.browser_detail_changed(focus, browser_detail),
+                self.tracker.browser_detail_changed(focus, browser_detail, privacy_mode),
                 focus=safe_focus,
             )
             return
 
         browser_detail = serialize_browser_detail(browser_detail_from_url(focus, url, privacy_mode))
-        self._broadcast_tracking_event("chrome_uia_value_changed", self.tracker.browser_detail_changed(focus, browser_detail), focus=safe_focus)
+        self._broadcast_tracking_event(
+            "chrome_uia_value_changed",
+            self.tracker.browser_detail_changed(focus, browser_detail, privacy_mode),
+            focus=safe_focus,
+        )
 
     def is_active_browser_window(
         self,
@@ -1045,6 +1326,44 @@ class AgentWebSocketServer:
         with self.last_focus_lock:
             self.last_focus_key = focus.key
 
+    def _latest_snapshot(self) -> dict[str, Any]:
+        with self.latest_snapshot_lock:
+            cached = self.latest_snapshot
+        if cached is not None:
+            return cached
+
+        snapshot = self.tracker.snapshot()
+        self._remember_snapshot(snapshot)
+        return snapshot
+
+    def _remember_snapshot(self, snapshot: dict[str, Any] | None) -> None:
+        if not snapshot or snapshot.get("periodEndMs") is not None:
+            return
+        with self.latest_snapshot_lock:
+            self.latest_snapshot = snapshot
+
+    def _privacy_mode_for_focus(self, focus: FocusInfo | None) -> str:
+        if not focus or not is_supported_browser(focus.process_name):
+            return NORMAL_BROWSER_STATUS
+
+        key = (focus.hwnd, focus.pid)
+        cached = self.browser_privacy_modes.get(key)
+        if cached is not None:
+            return cached
+
+        privacy_mode = chrome_privacy_mode(focus)
+        self.browser_privacy_modes[key] = privacy_mode
+        return privacy_mode
+
+    def _has_active_browser_subscription(self, focus: FocusInfo) -> bool:
+        subscription = self.browser_event_subscription
+        return bool(
+            subscription
+            and subscription.active
+            and subscription.focus.hwnd == focus.hwnd
+            and subscription.focus.pid == focus.pid
+        )
+
     def _broadcast_tracking_event(
         self,
         source: str,
@@ -1063,6 +1382,10 @@ class AgentWebSocketServer:
         if self.stopping:
             return
 
+        snapshot = event.get("snapshot") if event else None
+        if isinstance(snapshot, dict):
+            self._remember_snapshot(snapshot)
+
         try:
             self.loop.call_soon_threadsafe(lambda: asyncio.create_task(self.broadcast(event)))
         except RuntimeError:
@@ -1072,6 +1395,9 @@ class AgentWebSocketServer:
         await websocket.send(json.dumps(payload))
 
     async def broadcast(self, payload: dict[str, Any]) -> None:
+        snapshot = payload.get("snapshot")
+        if isinstance(snapshot, dict):
+            self._remember_snapshot(snapshot)
         if not self.clients:
             return
 
