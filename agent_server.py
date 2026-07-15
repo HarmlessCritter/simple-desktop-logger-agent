@@ -433,6 +433,8 @@ class ActivityTracker:
                 return None
 
             focus = privacy_safe_focus(focus, privacy_mode)
+            if self.current and self.current.key == focus.key:
+                return None
             change_ms = now_ms()
             previous = self.current
             previous_elapsed_ms = self._finalize_current_locked(change_ms)
@@ -1064,7 +1066,7 @@ class AgentWebSocketServer:
         self.latest_snapshot: dict[str, Any] | None = None
         self.latest_snapshot_lock = threading.Lock()
         self.revision = 0
-        self.last_focus_key: tuple[int, int, str, str] | None = None
+        self.last_focus_key: tuple[int, int, str, str, str] | None = None
         self.last_focus_lock = threading.Lock()
         self.watch_stop_event = threading.Event()
         self.stopping = False
@@ -1307,10 +1309,24 @@ class AgentWebSocketServer:
             return
 
         focus = get_foreground_focus()
-        self._broadcast_tracking_event(
-            "idle_monitor",
-            self.tracker.leave_afk(focus, self._privacy_mode_for_focus(focus)),
+        privacy_mode = self._privacy_mode_for_focus(focus)
+        afk_event = self.tracker.leave_afk(focus, privacy_mode)
+        self._broadcast_tracking_event("idle_monitor", afk_event)
+        if afk_event or not focus:
+            return
+
+        safe_focus = privacy_safe_focus(focus, privacy_mode)
+        with self.last_focus_lock:
+            focus_is_current = safe_focus.key == self.last_focus_key
+        if focus_is_current:
+            return
+
+        self.diagnostics.record(
+            "idle_focus_recovery",
+            note="Idle check recovered a foreground event that Windows did not deliver.",
+            focus=safe_focus,
         )
+        self.handle_focus_changed(focus, privacy_mode)
 
     def run_idle_monitor(self) -> None:
         while not self.watch_stop_event.wait(IDLE_CHECK_INTERVAL_SECONDS):

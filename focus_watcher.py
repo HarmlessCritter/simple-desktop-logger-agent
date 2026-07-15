@@ -36,8 +36,11 @@ class FocusInfo:
     display_name: str
 
     @property
-    def key(self) -> tuple[int, int, str, str]:
-        return (self.hwnd, self.pid, self.window_class, self.window_title)
+    def key(self) -> tuple[int, int, str, str, str]:
+        # A newly launched process can briefly resolve as ``pid:<number>``.
+        # Include the resolved process name so a later SHOW event or sanity
+        # check can replace that temporary identity with the real application.
+        return (self.hwnd, self.pid, self.process_name, self.window_class, self.window_title)
 
 
 WINDOWS_OPERATION = "\uc708\ub3c4\uc6b0 \uc870\uc791"
@@ -61,7 +64,7 @@ def get_explorer_display_name(window_class: str, title: str) -> str:
 def get_display_name(process_name: str, window_class: str, _title: str = "") -> str:
     normalized_process = process_name.lower()
     if normalized_process == "explorer.exe":
-        return get_explorer_display_name(window_class, title)
+        return get_explorer_display_name(window_class, _title)
 
     if normalized_process in WINDOWS_OPERATION_PROCESSES:
         return WINDOWS_OPERATION
@@ -146,6 +149,7 @@ user32.GetForegroundWindow.argtypes = []
 user32.GetForegroundWindow.restype = wintypes.HWND
 
 EVENT_SYSTEM_FOREGROUND = 0x0003
+EVENT_OBJECT_SHOW = 0x8002
 EVENT_OBJECT_NAMECHANGE = 0x800C
 OBJID_WINDOW = 0
 WINEVENT_OUTOFCONTEXT = 0x0000
@@ -158,6 +162,7 @@ class FocusEventWatcher:
         self.on_window_name_changed = on_window_name_changed
         self.previous: FocusInfo | None = None
         self.foreground_hook: wintypes.HANDLE | None = None
+        self.show_hook: wintypes.HANDLE | None = None
         self.name_hook: wintypes.HANDLE | None = None
         self._callback = WinEventProc(self._handle_event)
 
@@ -181,8 +186,17 @@ class FocusEventWatcher:
             0,
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         )
+        self.show_hook = user32.SetWinEventHook(
+            EVENT_OBJECT_SHOW,
+            EVENT_OBJECT_SHOW,
+            None,
+            self._callback,
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        )
 
-        if not self.foreground_hook or not self.name_hook:
+        if not self.foreground_hook or not self.name_hook or not self.show_hook:
             raise ctypes.WinError()
 
         try:
@@ -194,8 +208,11 @@ class FocusEventWatcher:
                 user32.UnhookWinEvent(self.foreground_hook)
             if self.name_hook:
                 user32.UnhookWinEvent(self.name_hook)
+            if self.show_hook:
+                user32.UnhookWinEvent(self.show_hook)
             self.foreground_hook = None
             self.name_hook = None
+            self.show_hook = None
 
     def _handle_event(
         self,
@@ -209,6 +226,10 @@ class FocusEventWatcher:
     ) -> None:
         if event == EVENT_SYSTEM_FOREGROUND:
             self._emit_current_focus()
+        elif event == EVENT_OBJECT_SHOW and id_object == OBJID_WINDOW:
+            foreground_hwnd = user32.GetForegroundWindow()
+            if hwnd and hwnd == foreground_hwnd:
+                self._emit_current_focus()
         elif event == EVENT_OBJECT_NAMECHANGE and id_object == OBJID_WINDOW:
             foreground_hwnd = user32.GetForegroundWindow()
             if hwnd and hwnd == foreground_hwnd:

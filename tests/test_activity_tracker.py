@@ -116,6 +116,17 @@ class FakeIconProvider:
 
 
 class ActivityTrackerTests(unittest.TestCase):
+    def test_duplicate_focus_signal_does_not_split_the_current_session(self) -> None:
+        store = FakeStore()
+        tracker = ActivityTracker(store, FakeIconProvider())
+
+        first_event = tracker.focus_changed(other_focus())
+        duplicate_event = tracker.focus_changed(other_focus())
+
+        self.assertEqual(first_event["type"], "focus_changed")
+        self.assertIsNone(duplicate_event)
+        self.assertEqual(store.sessions, [])
+
     def test_new_browser_site_is_in_snapshot_before_session_is_persisted(self) -> None:
         tracker = ActivityTracker(FakeStore(), FakeIconProvider())
         detail = BrowserDetail("chrome.exe", "https://youtube.com/watch?v=1", "youtube.com", "YouTube - Chrome", "tracked")
