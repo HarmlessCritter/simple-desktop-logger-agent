@@ -25,6 +25,7 @@ from PIL import Image, ImageDraw
 from activity_store import ActivityStore, serialize_focus, start_of_local_day_ms
 from binding_summary import (
     apply_bindings_to_totals,
+    binding_target_for_source,
     current_summary_target,
     ensure_current_group_item,
 )
@@ -40,10 +41,12 @@ from browser_tracking import (
     is_supported_browser,
     read_browser_detail,
     serialize_browser_detail,
+    site_display_name,
 )
 from focus_watcher import FocusEventWatcher, FocusInfo, get_foreground_focus
 from i18n import LANGUAGE_LABELS, get_language, set_language, text
 from icon_provider import IconProvider
+from snapshot_delta import build_snapshot_delta
 
 
 HOST = "127.0.0.1"
@@ -54,10 +57,11 @@ RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 LEGACY_RUN_KEY_NAMES = ("Task Tracker Agent",)
 SINGLE_INSTANCE_MUTEX = "Local\\SimpleDesktopLoggerAgentSingleton"
 ERROR_ALREADY_EXISTS = 183
-AFK_TIMEOUT_MS = 30_000
-IDLE_CHECK_INTERVAL_SECONDS = 0.25
+AFK_TIMEOUT_MS = 60_000
+IDLE_CHECK_INTERVAL_SECONDS = 1.0
 FOCUS_SANITY_CHECK_INTERVAL_SECONDS = 2.0
 FOCUS_SANITY_MONITOR_ENABLED = True
+MAX_TIMELINE_RANGE_MS = 7 * 24 * 60 * 60 * 1000
 INFO_SOURCE_URL = "https://github.com/HarmlessCritter/simple-desktop-logger-agent"
 MB_OK = 0x00000000
 MB_ICONINFORMATION = 0x00000040
@@ -117,7 +121,10 @@ def privacy_safe_focus(
     privacy_mode: str | None = None,
 ) -> FocusInfo | None:
     """Remove private Chrome page metadata before it enters tracker state."""
-    if not focus or not is_supported_browser(focus.process_name):
+    if not focus:
+        return focus
+    focus = replace(focus, window_title="")
+    if not is_supported_browser(focus.process_name):
         return focus
 
     resolved_privacy_mode = privacy_mode or chrome_privacy_mode(focus)
@@ -777,6 +784,30 @@ class ActivityTracker:
         with self.lock:
             return self._snapshot_locked(now_ms(), start_ms, end_ms)
 
+    def timeline(self, start_ms: int, end_ms: int) -> dict[str, Any]:
+        with self.lock:
+            generated_at = now_ms()
+            groups = self.store.binding_groups()
+            bindings = self.store.source_bindings()
+            entries = [
+                self._timeline_entry_locked(entry, groups, bindings)
+                for entry in self.store.timeline_between(start_ms, end_ms)
+            ]
+            return {
+                "type": "timeline",
+                "startMs": start_ms,
+                "endMs": end_ms,
+                "generatedAt": generated_at,
+                "entries": entries,
+                "currentEntry": self._current_timeline_entry_locked(
+                    start_ms,
+                    end_ms,
+                    generated_at,
+                    groups,
+                    bindings,
+                ),
+            }
+
     def is_current_window(self, focus: FocusInfo | None) -> bool:
         with self.lock:
             return bool(self.current and focus and self.current.hwnd == focus.hwnd)
@@ -785,7 +816,6 @@ class ActivityTracker:
         if not self.current or self.current_started_ms is None:
             return 0
 
-        self._refresh_current_title_from_foreground_locked()
         elapsed_ms = max(0, ended_at - self.current_started_ms)
         if not self.current_browser_detail_ignored:
             self.store.insert_session(self.current, self.current_started_ms, ended_at, self.current_browser_detail)
@@ -819,30 +849,7 @@ class ActivityTracker:
         browser_detail: dict[str, Any],
         focus: FocusInfo,
     ) -> str:
-        if str(browser_detail.get("privacy_mode") or NORMAL_BROWSER_STATUS) != NORMAL_BROWSER_STATUS:
-            return ""
-
-        title = focus.window_title
-        if title == "(untitled)" and self.current_browser_detail:
-            title = str(self.current_browser_detail.get("title") or title)
-        return title
-
-    def _refresh_current_title_from_foreground_locked(self) -> None:
-        if not self.current:
-            return
-        if is_supported_browser(self.current.process_name):
-            return
-
-        focus = privacy_safe_focus(get_foreground_focus())
-        if not focus or focus.hwnd != self.current.hwnd:
-            return
-
-        self.current = focus
-        if self.current_browser_detail is not None:
-            self.current_browser_detail = {
-                **self.current_browser_detail,
-                "title": self._browser_detail_title_locked(self.current_browser_detail, focus),
-            }
+        return ""
 
     def _snapshot_locked(
         self,
@@ -915,6 +922,101 @@ class ActivityTracker:
             self.store.get_activity_key(self.current) if self.current else "",
         )
 
+    def _timeline_entry_locked(
+        self,
+        source_entry: dict[str, Any],
+        groups: list[dict[str, Any]],
+        bindings: dict[str, str],
+    ) -> dict[str, Any]:
+        source_key = str(source_entry["sourceKey"])
+        target = binding_target_for_source(source_key, groups, bindings)
+        if target is None:
+            activity_key = str(source_entry["originalActivityKey"])
+            display_name = str(source_entry["originalDisplayName"] or source_entry["sourceLabel"])
+            kind = "activity"
+            group_id = None
+            icon_id = None
+        else:
+            activity_key = str(target["activityKey"])
+            display_name = str(target["displayName"])
+            kind = "user_group"
+            group_id = str(target["groupId"])
+            icon_id = str(target["iconId"])
+
+        return {
+            "sessionId": source_entry["sessionId"],
+            "startMs": source_entry["startMs"],
+            "endMs": source_entry["endMs"],
+            "activityKey": activity_key,
+            "displayName": display_name,
+            "kind": kind,
+            "groupId": group_id,
+            "iconId": icon_id,
+            "sourceKey": source_key,
+            "sourceType": source_entry["sourceType"],
+            "sourceLabel": source_entry["sourceLabel"],
+            "processName": source_entry["processName"],
+            "windowTitle": source_entry["windowTitle"],
+            "trackingStatus": source_entry["trackingStatus"],
+        }
+
+    def _current_timeline_entry_locked(
+        self,
+        start_ms: int,
+        end_ms: int,
+        generated_at: int,
+        groups: list[dict[str, Any]],
+        bindings: dict[str, str],
+    ) -> dict[str, Any] | None:
+        if (
+            not self.tracking
+            or self.afk
+            or self.ignored
+            or self.current is None
+            or self.current_started_ms is None
+            or self.current_browser_detail_ignored
+        ):
+            return None
+
+        current_end_ms = min(generated_at, end_ms)
+        if current_end_ms <= start_ms or current_end_ms <= self.current_started_ms:
+            return None
+
+        source_key = self.store.get_activity_key(self.current)
+        source_type = "application"
+        source_label = self.current.display_name
+        tracking_status: str | None = None
+        window_title = self.current.window_title
+
+        if is_supported_browser(self.current.process_name):
+            detail = self.current_browser_detail
+            source_key = browser_detail_key(detail) or "browser:other"
+            tracking_status = str((detail or {}).get("tracking_status") or "other")
+            if self.store.is_browser_detail_ignored(detail):
+                return None
+            host = str((detail or {}).get("host") or "")
+            source_type = "browser"
+            source_label = site_display_name(host, tracking_status)
+            window_title = str((detail or {}).get("title") or "") if tracking_status == "tracked" else ""
+
+        return self._timeline_entry_locked(
+            {
+                "sessionId": f"current:{self.current.hwnd}:{self.current_started_ms}",
+                "startMs": self.current_started_ms,
+                "endMs": current_end_ms,
+                "sourceKey": source_key,
+                "sourceType": source_type,
+                "sourceLabel": source_label,
+                "originalActivityKey": self.store.get_activity_key(self.current),
+                "originalDisplayName": self.current.display_name,
+                "processName": self.current.process_name,
+                "windowTitle": window_title,
+                "trackingStatus": tracking_status,
+            },
+            groups,
+            bindings,
+        )
+
     def _serialize_focus_with_icon_locked(self, focus: FocusInfo | None) -> dict[str, Any] | None:
         serialized = serialize_focus(focus)
         if serialized is None:
@@ -961,6 +1063,7 @@ class AgentWebSocketServer:
         self.browser_privacy_modes: dict[tuple[int, int], str] = {}
         self.latest_snapshot: dict[str, Any] | None = None
         self.latest_snapshot_lock = threading.Lock()
+        self.revision = 0
         self.last_focus_key: tuple[int, int, str, str] | None = None
         self.last_focus_lock = threading.Lock()
         self.watch_stop_event = threading.Event()
@@ -1010,8 +1113,9 @@ class AgentWebSocketServer:
     async def handle_client(self, websocket) -> None:
         self.clients.add(websocket)
         snapshot = self.tracker.snapshot()
+        snapshot["revision"] = self.revision
         self._remember_snapshot(snapshot)
-        await self.send(websocket, {"type": "agent_ready", "snapshot": snapshot})
+        await self.send(websocket, {"type": "agent_ready", "revision": self.revision, "snapshot": snapshot})
 
         try:
             async for raw_message in websocket:
@@ -1037,8 +1141,23 @@ class AgentWebSocketServer:
             start_ms = self._optional_int(message.get("startMs"))
             end_ms = self._optional_int(message.get("endMs"))
             snapshot = self.tracker.snapshot(start_ms, end_ms)
+            snapshot["revision"] = self.revision
             self._remember_snapshot(snapshot)
             await self.send(websocket, snapshot)
+        elif message_type == "get_revision":
+            await self.send(websocket, {"type": "revision", "revision": self.revision})
+        elif message_type == "get_timeline":
+            start_ms = self._required_int(message.get("startMs"))
+            end_ms = self._required_int(message.get("endMs"))
+            if (
+                start_ms is None
+                or end_ms is None
+                or end_ms <= start_ms
+                or end_ms - start_ms > MAX_TIMELINE_RANGE_MS
+            ):
+                await self.send(websocket, {"type": "error", "message": "Missing or invalid timeline range."})
+                return
+            await self.send(websocket, self.tracker.timeline(start_ms, end_ms))
         elif message_type == "ignore_activity":
             display_name = str(message.get("displayName") or "").strip()
             activity_key = str(message.get("activityKey") or display_name.lower()).strip().lower()
@@ -1127,6 +1246,9 @@ class AgentWebSocketServer:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    def _required_int(self, value: Any) -> int | None:
+        return value if type(value) is int else None
 
     def start_tracking(self) -> None:
         if self.stopping:
@@ -1226,6 +1348,11 @@ class AgentWebSocketServer:
         if self.stopping:
             return
 
+        # Native application title changes are intentionally ignored. Chrome's
+        # event is retained only as a fallback signal to re-check its URL.
+        if not is_supported_browser(focus.process_name):
+            return
+
         privacy_mode = self._privacy_mode_for_focus(focus)
         safe_focus = privacy_safe_focus(focus, privacy_mode)
         self._remember_focus(safe_focus)
@@ -1235,22 +1362,16 @@ class AgentWebSocketServer:
             return
 
         if self._has_active_browser_subscription(focus):
-            self.tracker.window_title_changed(focus, privacy_mode, include_snapshot=False)
             self.diagnostics.record(
                 "win_event_name_change",
-                {"type": "window_title_updated", "at": now_ms()},
+                {"type": "browser_window_changed", "at": now_ms()},
                 focus=safe_focus,
             )
             return
 
-        if is_supported_browser(focus.process_name):
-            browser_detail = serialize_browser_detail(read_browser_detail(focus, privacy_mode))
-            browser_event = self.tracker.browser_detail_changed(focus, browser_detail, privacy_mode)
-            self._broadcast_tracking_event("win_event_name_change", browser_event, focus=safe_focus)
-            return
-
-        title_event = self.tracker.window_title_changed(focus, privacy_mode)
-        self._broadcast_tracking_event("win_event_name_change", title_event, focus=safe_focus)
+        browser_detail = serialize_browser_detail(read_browser_detail(focus, privacy_mode))
+        browser_event = self.tracker.browser_detail_changed(focus, browser_detail, privacy_mode)
+        self._broadcast_tracking_event("win_event_name_change", browser_event, focus=safe_focus)
 
     def update_browser_event_subscription(self, focus: FocusInfo | None, privacy_mode: str | None = None) -> None:
         self.stop_browser_event_subscription()
@@ -1382,10 +1503,6 @@ class AgentWebSocketServer:
         if self.stopping:
             return
 
-        snapshot = event.get("snapshot") if event else None
-        if isinstance(snapshot, dict):
-            self._remember_snapshot(snapshot)
-
         try:
             self.loop.call_soon_threadsafe(lambda: asyncio.create_task(self.broadcast(event)))
         except RuntimeError:
@@ -1395,8 +1512,16 @@ class AgentWebSocketServer:
         await websocket.send(json.dumps(payload))
 
     async def broadcast(self, payload: dict[str, Any]) -> None:
-        snapshot = payload.get("snapshot")
+        self.revision += 1
+        payload["revision"] = self.revision
+        snapshot = payload.pop("snapshot", None)
         if isinstance(snapshot, dict):
+            snapshot["revision"] = self.revision
+            with self.latest_snapshot_lock:
+                previous_snapshot = self.latest_snapshot
+            payload["snapshotDelta"] = build_snapshot_delta(previous_snapshot, snapshot)
+            payload["snapshotPeriodStartMs"] = snapshot.get("periodStartMs")
+            payload["snapshotPeriodEndMs"] = snapshot.get("periodEndMs")
             self._remember_snapshot(snapshot)
         if not self.clients:
             return

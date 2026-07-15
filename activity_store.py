@@ -9,9 +9,11 @@ from typing import Any
 from uuid import uuid4
 
 from browser_tracking import (
+    LOCAL_BROWSER_SOURCE_KEY,
     OTHER_SITE_LABEL,
     browser_detail_key,
     favicon_url,
+    is_local_browser_host,
     is_supported_browser,
     normalize_browser_host,
     raw_browser_host,
@@ -182,6 +184,8 @@ class ActivityStore:
             "DELETE FROM ignored_activity_rules WHERE activity_key = ?",
             (FILE_EXPLORER,),
         )
+        self.connection.execute("UPDATE activity_sessions SET window_title = '' WHERE window_title <> ''")
+        self.connection.execute("UPDATE browser_session_details SET title = '' WHERE title <> ''")
         self.connection.commit()
 
     def close(self) -> None:
@@ -513,7 +517,7 @@ class ActivityStore:
                 focus.process_name,
                 focus.process_path,
                 focus.window_class,
-                focus.window_title,
+                "",
                 now_ms(),
             ),
         )
@@ -537,7 +541,7 @@ class ActivityStore:
                     str(browser_detail.get("browser_name") or focus.process_name),
                     str(browser_detail.get("url") or ""),
                     str(browser_detail.get("host") or ""),
-                    str(browser_detail.get("title") or focus.window_title),
+                    "",
                     str(browser_detail.get("tracking_status") or "other"),
                     now_ms(),
                 ),
@@ -546,6 +550,105 @@ class ActivityStore:
 
     def summary_since(self, since_ms: int) -> dict[str, dict[str, Any]]:
         return self.summary_between(since_ms, None)
+
+    def timeline_between(self, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+        """Return persisted, privacy-safe source sessions overlapping a fixed range."""
+        rows = self.connection.execute(
+            """
+            WITH ranked_browser_details AS (
+                SELECT
+                    activity_session_id,
+                    url,
+                    host,
+                    title,
+                    tracking_status,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY activity_session_id
+                        ORDER BY id DESC
+                    ) AS row_number
+                FROM browser_session_details
+            )
+            SELECT
+                activity_sessions.id AS session_id,
+                activity_sessions.started_at,
+                activity_sessions.ended_at,
+                activity_sessions.activity_key,
+                activity_sessions.display_name,
+                activity_sessions.process_name,
+                activity_sessions.window_title,
+                ranked_browser_details.url AS browser_url,
+                ranked_browser_details.host AS browser_host,
+                ranked_browser_details.title AS browser_title,
+                ranked_browser_details.tracking_status AS browser_tracking_status
+            FROM activity_sessions
+            LEFT JOIN ranked_browser_details
+                ON ranked_browser_details.activity_session_id = activity_sessions.id
+                AND ranked_browser_details.row_number = 1
+            WHERE activity_sessions.ended_at > ?
+                AND activity_sessions.started_at < ?
+                AND activity_sessions.activity_key NOT IN (
+                    SELECT activity_key
+                    FROM ignored_activity_rules
+                )
+            ORDER BY activity_sessions.started_at ASC, activity_sessions.id ASC
+            """,
+            (start_ms, end_ms),
+        ).fetchall()
+
+        ignored_browser_sources = self.ignored_browser_detail_source_keys()
+        entries: list[dict[str, Any]] = []
+        for row in rows:
+            clipped_start_ms = max(start_ms, int(row["started_at"]))
+            clipped_end_ms = min(end_ms, int(row["ended_at"]))
+            if clipped_end_ms <= clipped_start_ms:
+                continue
+
+            process_name = str(row["process_name"] or "")
+            source_key = str(row["activity_key"])
+            source_type = "application"
+            source_label = str(row["display_name"] or source_key)
+            window_title = str(row["window_title"] or "")
+            tracking_status: str | None = None
+
+            if is_supported_browser(process_name):
+                host = raw_browser_host(str(row["browser_url"] or "")) or str(row["browser_host"] or "")
+                tracking_status = str(row["browser_tracking_status"] or "other")
+                if is_local_browser_host(host):
+                    tracking_status = "tracked"
+                source_label = site_display_name(host, tracking_status)
+                source_key = (
+                    "browser:other"
+                    if source_label == OTHER_SITE_LABEL
+                    else browser_detail_key({"host": host, "tracking_status": tracking_status})
+                )
+                if source_key in ignored_browser_sources:
+                    continue
+                source_type = "browser"
+                # A non-tracked Chrome detail can be private or otherwise unreadable.
+                # Do not surface a title unless the persisted site detail is known safe.
+                window_title = (
+                    str(row["browser_title"] or "")
+                    if tracking_status == "tracked"
+                    else ""
+                )
+
+            entries.append(
+                {
+                    "sessionId": int(row["session_id"]),
+                    "startMs": clipped_start_ms,
+                    "endMs": clipped_end_ms,
+                    "sourceKey": source_key,
+                    "sourceType": source_type,
+                    "sourceLabel": source_label,
+                    "originalActivityKey": str(row["activity_key"]),
+                    "originalDisplayName": str(row["display_name"] or ""),
+                    "processName": process_name,
+                    "windowTitle": window_title,
+                    "trackingStatus": tracking_status,
+                }
+            )
+
+        return entries
 
     def summary_between(self, start_ms: int, end_ms: int | None = None) -> dict[str, dict[str, Any]]:
         if end_ms is None:
@@ -655,6 +758,8 @@ class ActivityStore:
             raise ValueError("Source key is required.")
         if normalized == "browser:other":
             raise ValueError("Other browser activity cannot be bound.")
+        if normalized == LOCAL_BROWSER_SOURCE_KEY:
+            return normalized
         if normalized.startswith("browser:"):
             host = normalize_browser_host(normalized.removeprefix("browser:"))
             if not host:
@@ -670,6 +775,8 @@ class ActivityStore:
         normalized = source_key.strip().lower()
         if not normalized.startswith("browser:"):
             raise ValueError("Browser source key is required.")
+        if normalized == LOCAL_BROWSER_SOURCE_KEY:
+            return normalized
         host = normalize_browser_host(normalized.removeprefix("browser:"))
         if not host:
             raise ValueError("Invalid browser source key.")
@@ -706,8 +813,11 @@ class ActivityStore:
             SELECT
                 activity_sessions.activity_key,
                 activity_sessions.process_name,
+                activity_sessions.window_title,
+                activity_sessions.ended_at,
                 browser_session_details.host,
                 browser_session_details.url,
+                browser_session_details.title,
                 browser_session_details.tracking_status,
                 {overlap_expression} AS overlap_ms
             FROM activity_sessions
@@ -735,9 +845,17 @@ class ActivityStore:
 
             host = raw_browser_host(str(row["url"] or "")) or str(row["host"] or "")
             tracking_status = str(row["tracking_status"] or "other")
+            if is_local_browser_host(host):
+                tracking_status = "tracked"
             normalized_label = site_display_name(host, tracking_status)
             normalized_host = normalize_browser_host(host)
-            detail_key = "other" if normalized_label == OTHER_SITE_LABEL else normalized_host
+            detail_key = (
+                "local"
+                if is_local_browser_host(host)
+                else "other"
+                if normalized_label == OTHER_SITE_LABEL
+                else normalized_host
+            )
             activity_key = str(row["activity_key"])
             source_key = f"browser:{detail_key}"
             if source_key in ignored_sources:
@@ -754,14 +872,28 @@ class ActivityStore:
                     "host": normalized_host if normalized_label != OTHER_SITE_LABEL else "",
                     "faviconUrl": favicon_url(host, tracking_status if normalized_label != OTHER_SITE_LABEL else "other"),
                     "trackingStatus": tracking_status if normalized_label != OTHER_SITE_LABEL else "other",
+                    "processName": str(row["process_name"] or ""),
+                    "windowTitle": "",
+                    "_latestEndedAt": -1,
                     "totalMs": 0,
                 },
             )
             detail["totalMs"] += overlap_ms
+            ended_at = int(row["ended_at"] or 0)
+            if ended_at >= int(detail.get("_latestEndedAt") or -1):
+                detail["_latestEndedAt"] = ended_at
+                detail["processName"] = str(row["process_name"] or "")
+                detail["windowTitle"] = (
+                    str(row["title"] or row["window_title"] or "")
+                    if tracking_status == "tracked"
+                    else ""
+                )
 
         for item in browser_items:
             activity_key = str(item["activityKey"])
             details = list(details_by_activity_key.get(activity_key, {}).values())
+            for detail in details:
+                detail.pop("_latestEndedAt", None)
             details.sort(key=lambda detail: int(detail["totalMs"]), reverse=True)
             item["browserDetails"] = details
             item["totalMs"] = max(

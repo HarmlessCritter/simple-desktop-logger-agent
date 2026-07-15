@@ -59,11 +59,7 @@ class BrowserEventPerformanceTests(unittest.TestCase):
                     server.handle_window_name_changed(focus)
 
                 read_detail.assert_not_called()
-                update_title.assert_called_once_with(
-                    focus,
-                    NORMAL_BROWSER_STATUS,
-                    include_snapshot=False,
-                )
+                update_title.assert_not_called()
             finally:
                 store.close()
 

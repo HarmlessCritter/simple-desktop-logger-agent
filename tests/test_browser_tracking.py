@@ -38,14 +38,14 @@ class BrowserTrackingTests(unittest.TestCase):
         self.assertEqual(normalize_browser_host("https://www.example-service.com/path"), "example-service.com")
         self.assertEqual(site_display_name("example-service.com"), "Example Service")
 
-    def test_local_hosts_are_other(self) -> None:
-        for host in ("localhost", "127.0.0.1"):
-            self.assertEqual(browser_tracking_status(host), "other")
-            self.assertEqual(site_display_name(host, "tracked"), "Other")
+    def test_local_hosts_have_a_bindable_local_source(self) -> None:
+        for host in ("localhost", "127.0.0.1", "::1"):
+            self.assertEqual(browser_tracking_status(host), "tracked")
+            self.assertEqual(site_display_name(host, "tracked"), "Local")
             self.assertEqual(favicon_url(host, "tracked"), "")
             self.assertEqual(
-                browser_detail_key({"host": host, "tracking_status": "other"}),
-                "browser:other",
+                browser_detail_key({"host": host, "tracking_status": "tracked"}),
+                "browser:local",
             )
 
     def test_private_chrome_never_reads_its_address_bar(self) -> None:

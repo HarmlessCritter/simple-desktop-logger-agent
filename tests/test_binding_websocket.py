@@ -5,6 +5,7 @@ from pathlib import Path
 
 from activity_store import ActivityStore
 from agent_server import AgentWebSocketServer
+from snapshot_delta import apply_snapshot_delta
 
 
 class FakeWebSocket:
@@ -23,12 +24,16 @@ class BindingWebSocketTests(unittest.IsolatedAsyncioTestCase):
                 server = AgentWebSocketServer(store)
                 websocket = FakeWebSocket()
                 server.clients.add(websocket)
+                event_snapshot = None
 
                 await server.handle_message(websocket, json.dumps({"type": "create_group", "name": "Game"}))
                 created = websocket.messages[-1]
+                event_snapshot = apply_snapshot_delta(event_snapshot, created["snapshotDelta"])
                 self.assertEqual(created["type"], "group_created")
+                self.assertEqual(created["revision"], 1)
+                self.assertEqual(event_snapshot["revision"], 1)
                 group = created["group"]
-                self.assertEqual(created["snapshot"]["bindingGroups"], [group])
+                self.assertEqual(event_snapshot["bindingGroups"], [group])
 
                 await server.handle_message(
                     websocket,
@@ -41,7 +46,9 @@ class BindingWebSocketTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
                 icon_changed = websocket.messages[-1]
+                event_snapshot = apply_snapshot_delta(event_snapshot, icon_changed["snapshotDelta"])
                 self.assertEqual(icon_changed["type"], "group_icon_changed")
+                self.assertEqual(icon_changed["revision"], 2)
                 self.assertEqual(icon_changed["group"]["iconId"], "gamepad")
 
                 await server.handle_message(
@@ -55,9 +62,11 @@ class BindingWebSocketTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
                 bound = websocket.messages[-1]
+                event_snapshot = apply_snapshot_delta(event_snapshot, bound["snapshotDelta"])
                 self.assertEqual(bound["type"], "source_bound")
+                self.assertEqual(bound["revision"], 3)
                 self.assertEqual(bound["sourceKey"], "browser:tooli.com")
-                self.assertIn(f"group:{group['groupId']}", bound["snapshot"]["totals"])
+                self.assertIn(f"group:{group['groupId']}", event_snapshot["totals"])
             finally:
                 store.close()
 
@@ -68,6 +77,7 @@ class BindingWebSocketTests(unittest.IsolatedAsyncioTestCase):
                 server = AgentWebSocketServer(store)
                 websocket = FakeWebSocket()
                 server.clients.add(websocket)
+                event_snapshot = None
                 group = store.create_binding_group("Game")
 
                 await server.handle_message(
@@ -92,6 +102,7 @@ class BindingWebSocketTests(unittest.IsolatedAsyncioTestCase):
                 server = AgentWebSocketServer(store)
                 websocket = FakeWebSocket()
                 server.clients.add(websocket)
+                event_snapshot = None
 
                 await server.handle_message(
                     websocket,
@@ -104,9 +115,10 @@ class BindingWebSocketTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
                 ignored = websocket.messages[-1]
+                event_snapshot = apply_snapshot_delta(event_snapshot, ignored["snapshotDelta"])
                 self.assertEqual(ignored["type"], "browser_detail_ignored")
                 self.assertEqual(ignored["sourceKey"], "browser:youtube.com")
-                ignored_item = ignored["snapshot"]["ignoredActivities"][0]
+                ignored_item = event_snapshot["ignoredActivities"][0]
                 self.assertEqual(ignored_item["activity_key"], "browser:youtube.com")
                 self.assertEqual(ignored_item["sourceType"], "browser")
 

@@ -43,6 +43,18 @@ def other_focus() -> FocusInfo:
     )
 
 
+def windows_operation_focus() -> FocusInfo:
+    return FocusInfo(
+        hwnd=606,
+        pid=707,
+        process_name="explorer.exe",
+        process_path="explorer.exe",
+        window_class="CabinetWClass",
+        window_title="Confidential Client Folder",
+        display_name="윈도우 조작",
+    )
+
+
 class FakeStore:
     def __init__(self) -> None:
         self.sessions = []
@@ -162,6 +174,30 @@ class ActivityTrackerTests(unittest.TestCase):
         self.assertEqual(persisted_detail["title"], "")
         self.assertEqual(persisted_detail["url"], "")
         self.assertEqual(persisted_detail["host"], "")
+
+    def test_windows_operation_title_is_redacted_before_state_and_persistence(self) -> None:
+        store = FakeStore()
+        tracker = ActivityTracker(store, FakeIconProvider())
+
+        event = tracker.focus_changed(windows_operation_focus())
+        tracker.focus_changed(other_focus())
+
+        self.assertEqual(event["focus"]["window_title"], "")
+        persisted_focus, _started_at, _ended_at, _browser_detail = store.sessions[0]
+        self.assertEqual(persisted_focus.display_name, "윈도우 조작")
+        self.assertEqual(persisted_focus.window_title, "")
+
+    def test_regular_application_title_is_redacted_before_state_and_persistence(self) -> None:
+        store = FakeStore()
+        tracker = ActivityTracker(store, FakeIconProvider())
+
+        event = tracker.focus_changed(other_focus())
+        tracker.focus_changed(windows_operation_focus())
+
+        self.assertEqual(event["focus"]["window_title"], "")
+        persisted_focus, _started_at, _ended_at, _browser_detail = store.sessions[0]
+        self.assertEqual(persisted_focus.process_name, "notepad.exe")
+        self.assertEqual(persisted_focus.window_title, "")
 
     def test_bound_current_browser_site_targets_group_live_time(self) -> None:
         store = FakeStore()

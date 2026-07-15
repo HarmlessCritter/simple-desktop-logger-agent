@@ -14,6 +14,8 @@ BROWSER_PROCESS_NAMES = {
 }
 
 OTHER_SITE_LABEL = "Other"
+LOCAL_SITE_LABEL = "Local"
+LOCAL_BROWSER_SOURCE_KEY = "browser:local"
 PRIVATE_BROWSER_STATUS = "private"
 UNKNOWN_BROWSER_STATUS = "unknown"
 NORMAL_BROWSER_STATUS = "normal"
@@ -57,6 +59,7 @@ SITE_LABELS = {
 }
 
 LOCAL_BROWSER_HOSTS = {
+    "::1",
     "127.0.0.1",
     "localhost",
 }
@@ -107,7 +110,7 @@ def read_browser_detail(
         browser_name=focus.process_name,
         url=url or "",
         host=host,
-        title=focus.window_title,
+        title="",
         tracking_status=status,
         privacy_mode=resolved_privacy_mode,
     )
@@ -132,7 +135,7 @@ def browser_detail_from_url(
         browser_name=focus.process_name,
         url=normalized_url or "",
         host=host,
-        title=focus.window_title,
+        title="",
         tracking_status=status,
         privacy_mode=resolved_privacy_mode,
     )
@@ -168,6 +171,8 @@ def browser_detail_key(detail: dict[str, Any] | BrowserDetail | None) -> str:
         status = str(detail.get("tracking_status") or "")
 
     normalized_host = normalize_browser_host(host)
+    if normalized_host in LOCAL_BROWSER_HOSTS:
+        return LOCAL_BROWSER_SOURCE_KEY
     return f"browser:{normalized_host}" if status == "tracked" and normalized_host else "browser:other"
 
 
@@ -391,6 +396,8 @@ def normalize_browser_host(url_or_host: str) -> str:
     value = url_or_host.strip()
     if not value:
         return ""
+    if value == "::1":
+        return value
 
     parse_target = value if "://" in value else f"https://{value}"
     parsed = urlparse(parse_target)
@@ -433,7 +440,7 @@ def raw_browser_host(url_or_host: str) -> str:
 
 
 def browser_tracking_status(host: str) -> str:
-    return "tracked" if host and not is_local_browser_host(host) else "other"
+    return "tracked" if host else "other"
 
 
 def is_local_browser_host(host: str) -> bool:
@@ -442,7 +449,9 @@ def is_local_browser_host(host: str) -> bool:
 
 def site_display_name(host: str, tracking_status: str = "tracked") -> str:
     normalized_host = normalize_browser_host(host)
-    if tracking_status != "tracked" or not normalized_host or normalized_host in LOCAL_BROWSER_HOSTS:
+    if normalized_host in LOCAL_BROWSER_HOSTS:
+        return LOCAL_SITE_LABEL
+    if tracking_status != "tracked" or not normalized_host:
         return OTHER_SITE_LABEL
 
     if normalized_host in SITE_LABELS:
@@ -470,7 +479,7 @@ def serialize_browser_detail(detail: BrowserDetail | None) -> dict[str, Any] | N
 def _looks_like_host(value: str) -> bool:
     if not value:
         return False
-    if value in {"localhost"}:
+    if value in {"localhost", "::1"}:
         return True
     if IPV4_RE.match(value):
         parts = value.split(".")

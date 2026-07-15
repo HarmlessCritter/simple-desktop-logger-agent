@@ -21,6 +21,29 @@ def group_activity_key(group_id: str) -> str:
     return f"{GROUP_KEY_PREFIX}{group_id}"
 
 
+def binding_target_for_source(
+    source_key: str,
+    groups: list[dict[str, Any]],
+    bindings: dict[str, str],
+) -> dict[str, Any] | None:
+    """Return the display group for one persisted source, if it is bound."""
+    group_id = bindings.get(source_key)
+    if not group_id:
+        return None
+
+    group = next((item for item in groups if str(item["groupId"]) == group_id), None)
+    if group is None:
+        return None
+
+    return {
+        "activityKey": group_activity_key(group_id),
+        "displayName": str(group["displayName"]),
+        "kind": "user_group",
+        "groupId": group_id,
+        "iconId": str(group.get("iconId") or "folder"),
+    }
+
+
 def apply_bindings_to_totals(
     raw_totals: dict[str, dict[str, Any]],
     groups: list[dict[str, Any]],
@@ -70,17 +93,13 @@ def current_summary_target(
     if not source_key:
         return None
 
-    group_id = bindings.get(source_key)
-    if not group_id:
-        return None
-
-    group = next((item for item in groups if str(item["groupId"]) == group_id), None)
-    if group is None:
+    target = binding_target_for_source(source_key, groups, bindings)
+    if target is None:
         return None
 
     return {
-        "activityKey": group_activity_key(group_id),
-        "displayName": str(group["displayName"]),
+        "activityKey": target["activityKey"],
+        "displayName": target["displayName"],
         "startedAt": started_at,
         "sourceKey": source_key,
     }
@@ -163,6 +182,8 @@ def _move_bound_browser_details(
                 "label": str(detail.get("label") or source_key),
                 "host": str(detail.get("host") or ""),
                 "faviconUrl": str(detail.get("faviconUrl") or ""),
+                "processName": str(detail.get("processName") or item.get("focus", {}).get("process_name") or ""),
+                "windowTitle": str(detail.get("windowTitle") or ""),
                 "totalMs": total_ms,
             }
             _append_or_merge_group_item(group, group_item)
@@ -215,6 +236,8 @@ def _current_group_item(
             "label": site_display_name(host, status),
             "host": host,
             "faviconUrl": favicon_url(host, status),
+            "processName": current.process_name if current else "",
+            "windowTitle": str(current_browser_detail.get("title") or "") if status == "tracked" else "",
             "totalMs": 0,
         }
 

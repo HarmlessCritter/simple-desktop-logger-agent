@@ -58,16 +58,13 @@ def get_explorer_display_name(window_class: str, title: str) -> str:
     return WINDOWS_OPERATION
 
 
-def get_display_name(process_name: str, window_class: str, title: str) -> str:
+def get_display_name(process_name: str, window_class: str, _title: str = "") -> str:
     normalized_process = process_name.lower()
     if normalized_process == "explorer.exe":
         return get_explorer_display_name(window_class, title)
 
     if normalized_process in WINDOWS_OPERATION_PROCESSES:
         return WINDOWS_OPERATION
-
-    if normalized_process == "applicationframehost.exe" and title:
-        return title
 
     return process_name
 
@@ -83,7 +80,6 @@ def get_foreground_focus() -> FocusInfo | None:
     if pid == os.getpid():
         return None
 
-    title = win32gui.GetWindowText(hwnd).strip()
     window_class = win32gui.GetClassName(hwnd)
 
     try:
@@ -97,14 +93,16 @@ def get_foreground_focus() -> FocusInfo | None:
         process_name = f"pid:{pid}"
         process_path = ""
 
+    display_name = get_display_name(process_name, window_class)
+
     return FocusInfo(
         hwnd=hwnd,
         pid=pid,
         process_name=process_name,
         process_path=process_path,
         window_class=window_class,
-        window_title=title or "(untitled)",
-        display_name=get_display_name(process_name, window_class, title),
+        window_title="",
+        display_name=display_name,
     )
 
 
