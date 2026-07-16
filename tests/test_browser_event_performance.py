@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from activity_store import ActivityStore
 from agent_server import AgentWebSocketServer
-from browser_tracking import NORMAL_BROWSER_STATUS
+from browser_tracking import BrowserDetail, NORMAL_BROWSER_STATUS
 from focus_watcher import FocusInfo
 
 
@@ -36,7 +36,7 @@ class BrowserEventPerformanceTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_title_event_does_not_reread_url_when_uia_subscription_is_active(self) -> None:
+    def test_title_event_rechecks_url_when_uia_subscription_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = ActivityStore(Path(directory) / "activity.db")
             try:
@@ -51,15 +51,24 @@ class BrowserEventPerformanceTests(unittest.TestCase):
                 server.browser_privacy_modes[(focus.hwnd, focus.pid)] = NORMAL_BROWSER_STATUS
                 server.browser_event_subscription = SimpleNamespace(active=True, focus=focus)
 
-                with patch("agent_server.read_browser_detail") as read_detail, patch.object(
+                changed_detail = BrowserDetail(
+                    "chrome.exe",
+                    "https://github.com/openai/example",
+                    "github.com",
+                    "",
+                    "tracked",
+                )
+                with patch("agent_server.read_browser_detail", return_value=changed_detail) as read_detail, patch.object(
                     server.tracker,
-                    "window_title_changed",
+                    "browser_detail_changed",
                     return_value=None,
-                ) as update_title:
+                ) as update_browser:
                     server.handle_window_name_changed(focus)
 
-                read_detail.assert_not_called()
-                update_title.assert_not_called()
+                read_detail.assert_called_once_with(focus, NORMAL_BROWSER_STATUS)
+                serialized_detail = update_browser.call_args.args[1]
+                self.assertEqual(serialized_detail["host"], "github.com")
+                update_browser.assert_called_once_with(focus, serialized_detail, NORMAL_BROWSER_STATUS)
             finally:
                 store.close()
 

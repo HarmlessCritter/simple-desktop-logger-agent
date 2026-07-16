@@ -1364,8 +1364,9 @@ class AgentWebSocketServer:
         if self.stopping:
             return
 
-        # Native application title changes are intentionally ignored. Chrome's
-        # event is retained only as a fallback signal to re-check its URL.
+        # Native application title changes are intentionally ignored. Browser
+        # title changes are a fallback signal because Chrome does not always
+        # emit an address-bar value event when the user switches tabs.
         if not is_supported_browser(focus.process_name):
             return
 
@@ -1375,14 +1376,6 @@ class AgentWebSocketServer:
         if not self.tracker.is_current_window(focus):
             self.diagnostics.record("win_event_name_change", note="Tracker window differed; treating as a foreground change.", focus=safe_focus)
             self.handle_focus_changed(focus, privacy_mode)
-            return
-
-        if self._has_active_browser_subscription(focus):
-            self.diagnostics.record(
-                "win_event_name_change",
-                {"type": "browser_window_changed", "at": now_ms()},
-                focus=safe_focus,
-            )
             return
 
         browser_detail = serialize_browser_detail(read_browser_detail(focus, privacy_mode))
